@@ -59,36 +59,87 @@ def load_audio(file_bytes, sr=22050, max_seconds=90):
         return y, sr
 
 def extract_features(y, sr):
-    tempo = librosa.beat.tempo(y=y, sr=sr, max_tempo=200, aggregate=None)
-    bpm = float(np.median(tempo)) if tempo is not None and len(tempo) > 0 else None
+    # BPM
+    try:
+        # novo local (librosa >= 0.10)
+        from librosa.feature.rhythm import tempo as tempo_fn
+        tempo_vals = tempo_fn(y=y, sr=sr, max_tempo=200, aggregate=None)
+    except Exception:
+        # fallback: alias antigo (para compat)
+        tempo_vals = librosa.beat.tempo(y=y, sr=sr, max_tempo=200, aggregate=None)
+
+    bpm = float(np.median(tempo_vals)) if tempo_vals is not None and len(tempo_vals) > 0 else None
+
+    # FFT e bandas…
     N = len(y)
     yf = np.abs(rfft(y))
     xf = rfftfreq(N, 1/sr)
     low = yf[(xf>=20) & (xf<120)].sum()
     mid = yf[(xf>=120) & (xf<2000)].sum()
     high = yf[(xf>=2000)].sum()
-    return {"bpm": bpm, "energy_low": float(low), "energy_mid": float(mid), "energy_high": float(high)}
 
-def call_gpt(features):
+    return {
+        "bpm": bpm,
+        "energy_low": float(low),
+        "energy_mid": float(mid),
+        "energy_high": float(high),
+    }
+
+
+def call_gpt(features: dict):
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     messages = [
         {"role": "system", "content": PROMPT},
         {"role": "user", "content": f"Features: {json.dumps(features)}"}
     ]
     data = {"model": MODEL, "messages": messages, "temperature": 0.1}
-    r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=data)
-    return r.json()["choices"][0]["message"]["content"]
+
+    r = requests.post("https://api.openai.com/v1/chat/completions",
+                      headers=headers, json=data, timeout=60)
+
+    # Log de diagnóstico para os Logs do Railway
+    try:
+        body = r.json()
+    except Exception:
+        raise RuntimeError(f"OpenAI HTTP {r.status_code} - resposta não-JSON: {r.text[:500]}")
+
+    if r.status_code != 200:
+        err = body.get("error", {})
+        raise RuntimeError(f"OpenAI HTTP {r.status_code} - {err.get('type')} - {err.get('message')}")
+
+    # Garante que 'choices' existe
+    if "choices" not in body or not body["choices"]:
+        raise RuntimeError(f"OpenAI resposta inesperada: {body}")
+
+    return body["choices"][0]["message"]["content"].strip()
+
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
+from fastapi.responses import JSONResponse
+
 @app.post("/classify")
 async def classify(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith((".mp3", ".wav")):
-        raise HTTPException(400, "Envie arquivos .mp3 ou .wav")
-    data = await file.read()
-    y, sr = load_audio(data)
-    feats = extract_features(y, sr)
-    result = call_gpt(feats)
-    return {"features": feats, "result": result}
+    try:
+        if not file.filename.lower().endswith((".mp3", ".wav")):
+            raise HTTPException(400, "Envie arquivos .mp3 ou .wav")
+        data = await file.read()
+        if not data:
+            raise HTTPException(400, "Arquivo vazio")
+
+        y, sr = load_audio(data)
+        feats = extract_features(y, sr)
+        try:
+            result = call_gpt(feats)
+        except Exception as e:
+            # Retorna features (útil p/ debugar) + erro legível
+            return JSONResponse(status_code=502, content={"ok": False, "features": feats, "error": str(e)})
+
+        return {"ok": True, "features": feats, "result": result}
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": f"processing failed: {e.__class__.__name__}: {e}"})
