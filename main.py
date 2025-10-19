@@ -275,7 +275,7 @@ def candidates_by_bpm(bpm: float) -> List[str]:
     if bpm is None:
         return list(SOFT_RULES.keys())
 
-    margin = 2.0
+    margin = 4.0
     cands = []
     for name, meta in SOFT_RULES.items():
         lo, hi = meta["bpm"]
@@ -295,16 +295,15 @@ def format_rules_for_candidates(cands: List[str]) -> str:
         lo_bpm, hi_bpm = m["bpm"]
         lp = m["bands_pct"]["low"]; mp = m["bands_pct"]["mid"]; hp = m["bands_pct"]["high"]
         hr_lo, hr_hi = m["hp_ratio"]
-        on_lo, on_hi = m["onset_strength"]
         lines.append(
             f"Nome: {name}\n"
             f"BPM: {lo_bpm}–{hi_bpm}\n"
             f"Bandas%: low={lp[0]:.2f}–{lp[1]:.2f} | mid={mp[0]:.2f}–{mp[1]:.2f} | high={hp[0]:.2f}–{hp[1]:.2f}\n"
             f"HP Ratio: {hr_lo:.2f}–{hr_hi:.2f}\n"
-            f"Onset: {on_lo:.2f}–{on_hi:.2f}\n"
             f"Assinaturas: {m['signatures']}\n"
             f"---"
         )
+
     return "\n".join(lines)
 
 
@@ -313,8 +312,14 @@ Você é um especialista em música eletrônica. Classifique a faixa com base na
 As features vêm do trecho 60–120s (ou dos 60s finais se a faixa tiver menos de 2 minutos).
 
 Use APENAS um subgênero dentre CANDIDATES.
-Compare as FEATURES com as faixas numéricas fornecidas nas CANDIDATE_RULES (BPM, Bandas%, HP Ratio, Onset) 
-e escolha o candidato cuja sobreposição seja mais consistente. As faixas são guias (não regras rígidas).
+Compare as FEATURES com as faixas numéricas em CANDIDATE_RULES (BPM, Bandas%, HP Ratio).
+Calcule uma similaridade ponderada (não precisa mostrar): 
+- BPM (peso 0.4): mais alto se o BPM cair dentro da faixa do candidato (ou perto do centro da faixa).
+- Bandas% (peso 0.4): mais alto quanto mais low/mid/high_pct caírem nas faixas do candidato.
+- HP Ratio (peso 0.2): mais alto se ficar dentro da faixa do candidato.
+
+Escolha o candidato de MAIOR similaridade. 
+Só use 'Subgênero Não Identificado' se a similaridade final for muito baixa (ex.: < 0.40).
 
 Responda exatamente em DUAS linhas:
 Subgênero: <um dos CANDIDATES ou 'Subgênero Não Identificado'>
@@ -322,8 +327,9 @@ Confiança: <número inteiro de 0 a 100>
 
 Observações internas (não exponha):
 - Absorções: Bass House ← Electro House; Uplifting/Progressive Trance ← Vocal Trance; Psytrance ← Goa; Dubstep ← Riddim.
-- Se não houver compatibilidade suficiente, use 'Subgênero Não Identificado' e confiança 0.
+- Não há necessidade de perfeição de faixa; priorize o candidato com melhor aderência geral às faixas numéricas.
 """
+
 
 app = FastAPI(title="saasdj-backend")
 app.add_middleware(
@@ -461,6 +467,50 @@ def call_gpt(features: dict, candidates: List[str]):
     content = body["choices"][0]["message"]["content"].strip()
     return content
 
+def _score_in_range(val, rng):
+    lo, hi = rng
+    if val is None:
+        return 0.0
+    if val < lo:
+        return max(0.0, 1.0 - (lo - val) / max(hi - lo, 1e-6))
+    if val > hi:
+        return max(0.0, 1.0 - (val - hi) / max(hi - lo, 1e-6))
+    mid = (lo + hi) / 2.0
+    half = (hi - lo) / 2.0 + 1e-6
+    return 1.0 + max(0.0, 0.2 * (1.0 - abs(val - mid) / half))
+
+def backend_fallback_best_candidate(features: dict, candidates: list[str]) -> tuple[str, int]:
+    bpm = features.get("bpm")
+    lp = features.get("low_pct", 0.0)
+    mp = features.get("mid_pct", 0.0)
+    hp = features.get("high_pct", 0.0)
+    hpr = features.get("hp_ratio", 0.0)
+
+    best_name = "Subgênero Não Identificado"
+    best_score = 0.0
+
+    for name in candidates:
+        rule = SOFT_RULES[name]
+        s_bpm = _score_in_range(bpm, rule["bpm"])
+        s_low = _score_in_range(lp, rule["bands_pct"]["low"])
+        s_mid = _score_in_range(mp, rule["bands_pct"]["mid"])
+        s_high = _score_in_range(hp, rule["bands_pct"]["high"])
+        s_hp = _score_in_range(hpr, rule["hp_ratio"])
+
+        bands_avg = (s_low + s_mid + s_high) / 3.0
+        score = 0.4 * s_bpm + 0.4 * bands_avg + 0.2 * s_hp
+
+        if score > best_score:
+            best_score = score
+            best_name = name
+
+    if best_score < 0.40:
+        return "Subgênero Não Identificado", 0
+
+    conf = int(min(95, max(50, 50 + (best_score - 0.40) * 100)))
+    return best_name, conf
+
+
 
 @app.get("/health")
 def health():
@@ -510,10 +560,16 @@ async def classify(file: UploadFile = File(...)):
                 except Exception:
                     conf = 0
 
-        # Sanitiza subgênero (se vier fora dos candidatos e não for 'Não Identificado', force 'Não Identificado')
+        # 5) Sanitiza subgênero (se vier fora do universo conhecido, força "Não Identificado")
         if sub != "Subgênero Não Identificado" and sub not in SOFT_RULES:
             sub = "Subgênero Não Identificado"
             conf = 0
+
+        # 6) Fallback heurístico se o GPT não identificar
+        if sub == "Subgênero Não Identificado":
+            fb_sub, fb_conf = backend_fallback_best_candidate(feats, cands)
+            if fb_sub != "Subgênero Não Identificado":
+                sub, conf = fb_sub, max(conf, fb_conf)
 
         return {
             "bpm": bpm_val,
