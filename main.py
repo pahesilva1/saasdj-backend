@@ -123,12 +123,15 @@ def extract_features(segment: np.ndarray, sr: int) -> dict:
 # ==============================
 
 PROMPT = """
-Você é um especialista em música eletrônica.
-Receberá dados técnicos sobre uma faixa (BPM, distribuição espectral, HP ratio e força rítmica).
-Classifique em UM subgênero da lista fornecida abaixo.
-Caso os dados não coincidam claramente com nenhum, retorne "Subgênero Não Identificado".
+Você é um especialista em música eletrônica. 
+Receberá dados técnicos sobre uma faixa (BPM, proporção de energia em graves/médios/agudos, razão harmônica-percussiva e força rítmica).
+Sua tarefa é classificar a faixa em **um único subgênero** da lista abaixo.
 
-Subgêneros disponíveis:
+A resposta deve ser **apenas duas linhas**:
+Subgênero: <nome exato>
+Explicação: <1 frase curta explicando com base nos dados>
+
+Subgêneros possíveis:
 Deep House, Tech House, Minimal Bass (Tech House), Progressive House, Bass House,
 Funky / Soulful House, Brazilian Bass, Future House, Afro House, Indie Dance,
 Detroit Techno, Acid Techno, Industrial Techno, Peak Time Techno, Hard Techno,
@@ -136,29 +139,54 @@ Melodic Techno, High-Tech Minimal, Uplifting Trance, Progressive Trance, Psytran
 Dark Psytrance, Big Room, Progressive EDM, Hardstyle, Rawstyle, Gabber Hardcore,
 UK/Happy Hardcore, Jumpstyle, Dubstep, Drum & Bass, Liquid DnB, Neurofunk.
 
-Regras gerais (internas):
-- BPM:
-  • ~120–126 → House / Melodic Techno / Progressive House
-  • 126–132 → Techno / Tech House
-  • 134–140 → Trance / Peak Time Techno
-  • 140+ → Hard Techno, Hardstyle, Drum & Bass (se 170–180)
-- Distribuição:
-  • Low alto → estilos com kick forte (Tech House, Techno)
-  • Mid alto → estilos melódicos (Melodic Techno, Progressive)
-  • High alto → estilos energéticos (Techno, EDM)
-- HP Ratio:
-  • > 1.2 → Melódico (Melodic Techno, Progressive)
-  • 0.8–1.1 → Balanceado (Tech House, Progressive House)
-  • < 0.8 → Percussivo (Techno, Hard Techno)
-- Onset Strength:
-  • Alto → estilos com batida seca/constante (Tech House, Techno, Hard)
-  • Médio → estilos fluídos (Melodic Techno, Progressive)
-  • Baixo → Ambient, Deep House (menos ataque)
+---
 
-Responda **exatamente** em duas linhas:
-Subgênero: <um da lista>
-Explicação: <1–3 frases musicais justificando sua escolha>
+🎚️ Interprete as features com base em faixas musicais típicas (use **intervalos**, não valores fixos):
+
+🔹 **BPM (faixa aproximada)**
+- 118–125 → Deep / Funky / Soulful House, Indie Dance  
+- 124–130 → Tech House, Progressive House, Melodic Techno  
+- 128–136 → Techno (Peak Time, High-Tech, Melodic)  
+- 134–142 → Trance (Progressive, Uplifting, Psy)  
+- 145–160 → Hard Techno, Hard Dance  
+- 170–180 → Drum & Bass, Liquid, Neurofunk  
+
+🔹 **Low / Mid / High Energy (%)**
+- Low alto (45–60%) → estilos centrados no kick/bassline (Techno, Tech House)  
+- Mid alto (35–50%) → estilos melódicos e progressivos (Melodic Techno, Progressive House, Trance)  
+- High alto (25–40%) → estilos energéticos, com hi-hats e brilho (EDM, Peak Time Techno, Big Room)  
+
+🔹 **HP Ratio (Harmônico/Percussivo)**
+- < 0.9 → percussivo e seco → Hard Techno, Peak Time, Tech House  
+- 0.9–1.2 → equilibrado → Progressive House, Progressive EDM, Techno  
+- > 1.2 → melódico e atmosférico → Melodic Techno, Progressive Trance, Uplifting Trance  
+
+🔹 **Onset Strength (força rítmica)**
+- 0.2–0.5 → grooves suaves ou deep → Deep House, Indie Dance  
+- 0.5–0.7 → fluído → Progressive / Melodic estilos  
+- 0.7–1.0 → batida seca, direta → Tech House, Peak Time, Hard Techno  
+
+---
+
+🎧 Exemplos referenciais (use como base de raciocínio, não como regra exata):
+
+- **Melodic Techno:** BPM ~122–128, hp_ratio >1.2, mid_pct alto (melodias e atmosferas progressivas)
+- **Hard Techno:** BPM 140–155, hp_ratio <0.9, low_pct alto (kick agressivo e pouca melodia)
+- **Uplifting Trance:** BPM 136–140, hp_ratio >1.2, mid_pct alto, high_pct moderado (melódico e eufórico)
+- **Tech House:** BPM 124–128, low_pct alto, hp_ratio 0.9–1.1, onset forte e groove seco
+- **Progressive House:** BPM 122–128, mid_pct e hp_ratio equilibrados, flow contínuo e harmônico
+- **Drum & Bass:** BPM 170–178, high_pct alto, hp_ratio baixo (ritmo frenético)
+
+---
+
+⚙️ Instruções finais:
+1. Use **todos os dados juntos** — não confie apenas no BPM.  
+2. Se os dados parecerem ambíguos, escolha o subgênero **mais provável musicalmente**.  
+3. Se nada fizer sentido, retorne:
+Subgênero: Uncategorized Genre
+Explicação: Dados não coincidem claramente com nenhum subgênero.
 """
+
 
 def call_gpt(features: dict) -> str:
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
@@ -229,16 +257,9 @@ async def classify(file: UploadFile = File(...)):
             sub = "Subgênero Não Identificado"
 
         return JSONResponse({
+            "arquivo": file.filename,
             "bpm": feats["bpm"],
-            "low_pct": feats["low_pct"],
-            "mid_pct": feats["mid_pct"],
-            "high_pct": feats["high_pct"],
-            "hp_ratio": feats["hp_ratio"],
-            "onset_strength": feats["onset_strength"],
             "subgenero": sub,
-            "explicacao": explic,
-            "duracao_total_seg": round(dur, 1),
-            "janela": "centro (30s)"
         })
 
     except HTTPException as he:
