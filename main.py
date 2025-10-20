@@ -107,14 +107,15 @@ def extract_features(segment: np.ndarray, sr: int) -> dict:
     # Força rítmica média
     onset_strength = float(np.mean(onset_env) / np.max(onset_env))
 
-    return {
-        "bpm": round(bpm),
-        "low_pct": low_pct,
-        "mid_pct": mid_pct,
-        "high_pct": high_pct,
-        "hp_ratio": round(hp_ratio, 2),
-        "onset_strength": round(onset_strength, 3),
+     features = {
+        "bpm": float(round(bpm)),
+        "low_pct": float(low_pct),
+        "mid_pct": float(mid_pct),
+        "high_pct": float(high_pct),
+        "hp_ratio": float(round(hp_ratio, 2)),
+        "onset_strength": float(round(onset_strength, 3)),
     }
+    return features
 
 
 # ==============================
