@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-SaaSDJ Backend v1.4 – Musical (com candidates por BPM e resposta minimalista)
+SaaSDJ Backend v1.5 – 3 janelas + pré-ranque de candidatos
 
-Mudanças principais:
-- Janela fixa de 30s no centro da música (drop principal)
-- Features musicais: BPM, Low/Mid/High %, HP ratio, Onset strength
-- Filtro de candidatos por BPM (reduz ambiguidades)
-- Prompt força escolha APENAS dentro de CANDIDATES
-- Fallback seguro: se o GPT derrapar, usa o 1º candidato
+Mudanças (focadas e pequenas):
+- Analisa 3 janelas de 30s (início, centro, fim)
+- Escolhe a janela com mais "punch de pista" (onset + percussivo)
+- Pré-ranqueia CANDIDATES por heurísticas simples (EDM/Tech House/Minimal vs Melodic/Trance)
+- Prompt com guard-rails (evitar "Indie Dance" indevido)
 """
 
 import os
@@ -53,137 +52,182 @@ SUBGENRES = [
 
 
 # ==============================
-# FUNÇÕES DE ÁUDIO
+# CARREGAMENTO E JANELAS
 # ==============================
 
-def load_audio_center_segment(file_bytes: bytes, sr: int = 22050, segment_duration: float = 30.0):
-    """Carrega áudio, converte para mono, pega o trecho central de 30s."""
+def load_audio(file_bytes: bytes, sr: int = 22050):
+    """Carrega áudio com pydub, mono + sr fixo, retorna samples float32 [-1,1] e sr."""
     audio = AudioSegment.from_file(io.BytesIO(file_bytes))
     audio = audio.set_channels(1).set_frame_rate(sr)
     samples = np.array(audio.get_array_of_samples()).astype(np.float32)
     samples /= np.iinfo(audio.array_type).max
-
-    total_duration = len(samples) / sr
-    start = max(0, int((total_duration / 2 - segment_duration / 2) * sr))
-    end = min(len(samples), int((total_duration / 2 + segment_duration / 2) * sr))
-    segment = samples[start:end]
-
-    return segment, sr, total_duration
+    return samples, sr
 
 
-def extract_features(segment: np.ndarray, sr: int) -> dict:
-    """
-    Extrai features musicais de um trecho mono:
-      - BPM (estimativa robusta com 2 métodos + correção half-time)
-      - Distribuição espectral (% Low/Mid/High)
-      - HP Ratio (Harmônico/ Percussivo) com fallback seguro
-      - Onset Strength (força rítmica média normalizada)
-    Retorna tipos nativos do Python.
-    """
-    # ---------------------------
-    # BPM (duas estimativas + escolha por bandas comuns)
-    # ---------------------------
+def slice_windows(samples: np.ndarray, sr: int, seg_dur: float = 30.0):
+    """Gera 3 janelas de 30s: início (~0:45–1:15), centro e fim (últimos 30s)."""
+    n = len(samples)
+    total_sec = n / sr
+    L = int(seg_dur * sr)
+
+    # Janela A: início (tenta 0:45–1:15; se a música for curta, começa no 0)
+    a_start_sec = 45.0
+    if total_sec < 75.0:
+        a_start = 0
+    else:
+        a_start = int(a_start_sec * sr)
+    a_end = min(n, a_start + L)
+    if a_end - a_start < L:
+        a_start = max(0, a_end - L)
+    win_a = samples[a_start:a_end]
+
+    # Janela B: centro
+    mid = n // 2
+    b_start = max(0, mid - L // 2)
+    b_end = min(n, b_start + L)
+    if b_end - b_start < L:
+        b_start = max(0, b_end - L)
+    win_b = samples[b_start:b_end]
+
+    # Janela C: fim (últimos 30s)
+    c_end = n
+    c_start = max(0, c_end - L)
+    win_c = samples[c_start:c_end]
+
+    return [win_a, win_b, win_c]
+
+
+# ==============================
+# FEATURES
+# ==============================
+
+def _bpm_from_segment(segment: np.ndarray, sr: int) -> float | None:
+    """Retorna bpm estimado (com correção half-time); None se não der."""
+    if segment.size == 0:
+        return None
     try:
         onset_env = librosa.onset.onset_strength(y=segment, sr=sr)
     except Exception:
         onset_env = np.array([], dtype=np.float32)
 
-    # Estimativa A: média do vetor de tempos (se existir)
-    bpm_a = None
+    bpm_list = []
+
+    # A) média de tempos do onset_env
     if onset_env.size:
         try:
             tempos = librosa.beat.tempo(onset_envelope=onset_env, sr=sr, aggregate=None)
             if tempos is not None and len(tempos) > 0:
-                bpm_a = float(np.mean(tempos))
+                bpm_list.append(float(np.mean(tempos)))
         except Exception:
-            bpm_a = None
+            pass
 
-    # Estimativa B: beat_track direto
-    bpm_b = None
+    # B) beat_track direto
     try:
         tempo_bt, _ = librosa.beat.beat_track(y=segment, sr=sr)
         if tempo_bt and float(tempo_bt) > 0:
-            bpm_b = float(tempo_bt)
+            bpm_list.append(float(tempo_bt))
     except Exception:
-        bpm_b = None
+        pass
 
-    # Corrige half-time e coleciona candidatas
-    candidates_bpm: list[float] = []
-    for v in (bpm_a, bpm_b):
-        if v is None:
-            continue
-        vv = v * 2.0 if v < 90.0 else v
-        candidates_bpm.append(vv)
+    if not bpm_list:
+        return None
 
-    # Escolhe a mais próxima de bandas frequentes de música eletrônica
-    if candidates_bpm:
-        bands = [(124, 130), (130, 138), (136, 142), (150, 160), (170, 178)]
-        def dist_to_bands(x: float) -> float:
-            best = float("inf")
-            for a, b in bands:
-                if a <= x <= b:
-                    return 0.0
-                best = min(best, abs(x - a), abs(x - b))
-            return best
-        bpm_val = min(candidates_bpm, key=dist_to_bands)
-    else:
-        bpm_val = 128.0  # valor seguro padrão
+    # half-time fix
+    bpm_list = [x * 2.0 if x < 90.0 else x for x in bpm_list]
 
-    # ---------------------------
-    # FFT: distribuição de energia por bandas
-    # ---------------------------
+    # escolher a mais perto de bandas comuns
+    bands = [(124, 130), (130, 138), (136, 142), (150, 160), (170, 178)]
+    def dist_to_bands(x: float) -> float:
+        best = float("inf")
+        for a, b in bands:
+            if a <= x <= b:
+                return 0.0
+            best = min(best, abs(x - a), abs(x - b))
+        return best
+
+    return min(bpm_list, key=dist_to_bands)
+
+
+def _onset_strength(segment: np.ndarray, sr: int) -> float:
     try:
-        spectrum = np.abs(rfft(segment))
-        freqs = np.fft.rfftfreq(len(segment), 1.0 / sr)
-
-        low_band = (freqs >= 20) & (freqs < 250)
-        mid_band = (freqs >= 250) & (freqs < 4000)
-        high_band = (freqs >= 4000) & (freqs <= 20000)
-
-        low_energy = float(np.sum(spectrum[low_band]))
-        mid_energy = float(np.sum(spectrum[mid_band]))
-        high_energy = float(np.sum(spectrum[high_band]))
-
-        total_energy = max(low_energy + mid_energy + high_energy, 1e-9)
-        low_pct = float(round((low_energy / total_energy) * 100.0, 2))
-        mid_pct = float(round((mid_energy / total_energy) * 100.0, 2))
-        high_pct = float(round((high_energy / total_energy) * 100.0, 2))
-    except Exception:
-        low_pct, mid_pct, high_pct = 33.33, 33.33, 33.34  # fallback neutro
-
-    # ---------------------------
-    # HPSS: razão Harmônico/ Percussivo (com fallback)
-    # ---------------------------
-    try:
-        harmonic, percussive = librosa.effects.hpss(segment)
-        h_mean = float(np.mean(np.abs(harmonic))) if harmonic.size else 0.0
-        p_mean = float(np.mean(np.abs(percussive))) if percussive.size else 1e-8
-        hp_ratio = float(round((h_mean / p_mean) if p_mean > 0 else 1.0, 2))
-    except Exception:
-        hp_ratio = 1.0  # equilíbrio como fallback
-
-    # ---------------------------
-    # Onset Strength normalizado
-    # ---------------------------
-    if onset_env.size:
+        onset_env = librosa.onset.onset_strength(y=segment, sr=sr)
+        if onset_env.size == 0:
+            return 0.0
         denom = float(np.max(onset_env)) if float(np.max(onset_env)) > 0 else 1.0
-        onset_strength = float(round(float(np.mean(onset_env)) / denom, 3))
-    else:
-        onset_strength = 0.0
+        return float(round(float(np.mean(onset_env)) / denom, 3))
+    except Exception:
+        return 0.0
 
-    # ---------------------------
-    # Saída (tipos nativos)
-    # ---------------------------
-    features = {
-        "bpm": int(round(bpm_val)),
-        "low_pct": float(low_pct),
-        "mid_pct": float(mid_pct),
-        "high_pct": float(high_pct),
-        "hp_ratio": float(hp_ratio),
-        "onset_strength": float(onset_strength),
-    }
-    return features
 
+def _hp_ratio(segment: np.ndarray) -> float:
+    try:
+        H, P = librosa.effects.hpss(segment)
+        h_mean = float(np.mean(np.abs(H))) if H.size else 0.0
+        p_mean = float(np.mean(np.abs(P))) if P.size else 1e-8
+        return float(round((h_mean / p_mean) if p_mean > 0 else 1.0, 2))
+    except Exception:
+        return 1.0
+
+
+def _energy_bands(segment: np.ndarray, sr: int):
+    try:
+        spec = np.abs(rfft(segment))
+        freqs = np.fft.rfftfreq(len(segment), 1.0 / sr)
+        low = float(np.sum(spec[(freqs >= 20) & (freqs < 250)]))
+        mid = float(np.sum(spec[(freqs >= 250) & (freqs < 4000)]))
+        high = float(np.sum(spec[(freqs >= 4000) & (freqs <= 20000)]))
+        total = max(low + mid + high, 1e-9)
+        return (
+            float(round((low / total) * 100.0, 2)),
+            float(round((mid / total) * 100.0, 2)),
+            float(round((high / total) * 100.0, 2)),
+        )
+    except Exception:
+        return 33.33, 33.33, 33.34
+
+
+def pick_best_window(wins: list[np.ndarray], sr: int) -> tuple[np.ndarray, dict]:
+    """
+    Escolhe a janela com mais 'punch de pista':
+      score = 0.6*onset_strength + 0.4*(1/(1+1/hp_ratio_norm))
+    onde hp_ratio_norm favorece conteúdo percussivo moderado a forte.
+    """
+    best_idx, best_score, best_feats = 0, -1.0, None
+    for i, w in enumerate(wins):
+        if w.size == 0:
+            continue
+        hp = _hp_ratio(w)
+        on = _onset_strength(w, sr)
+        # percussivo favorecido quando hp_ratio baixo; construir um ganho simples:
+        # mapeia hp em [0.5..1.5+] para [1.0 .. 0.5]
+        perc_gain = max(0.0, min(1.0, 1.5 - hp))  # hp=0.8 -> 0.7 ; hp=1.2 -> 0.3
+        score = 0.6 * on + 0.4 * perc_gain
+
+        if score > best_score:
+            # calc features provisórias
+            bpm = _bpm_from_segment(w, sr) or 128.0
+            low, mid, high = _energy_bands(w, sr)
+            best_idx, best_score = i, score
+            best_feats = {
+                "bpm": int(round(bpm)),
+                "low_pct": float(low),
+                "mid_pct": float(mid),
+                "high_pct": float(high),
+                "hp_ratio": float(hp),
+                "onset_strength": float(on),
+            }
+    return wins[best_idx], best_feats
+
+
+def extract_features_from_best_window(samples: np.ndarray, sr: int) -> dict:
+    wins = slice_windows(samples, sr, seg_dur=30.0)
+    _, feats = pick_best_window(wins, sr)
+    return feats
+
+
+# ==============================
+# CANDIDATES + PRÉ-RANQUE
+# ==============================
 
 def candidates_by_bpm(bpm: float | int | None) -> list[str]:
     """Retorna subgêneros plausíveis dado o BPM estimado (com janelas sobrepostas)."""
@@ -201,9 +245,10 @@ def candidates_by_bpm(bpm: float | int | None) -> list[str]:
     # House / Indie (118–126)
     if 116 <= b <= 127:
         add([
-            "Deep House","Funky / Soulful House","Indie Dance","Progressive House",
-            "Tech House","Minimal Bass (Tech House)","Bass House","Brazilian Bass",
-            "Future House","Afro House","Melodic Techno","High-Tech Minimal","Detroit Techno"
+            "Tech House","Minimal Bass (Tech House)","Bass House",
+            "Progressive House","Brazilian Bass","Future House",
+            "Deep House","Funky / Soulful House","Afro House","Indie Dance",
+            "Melodic Techno","High-Tech Minimal","Detroit Techno"
         ])
 
     # Techno / Peak (126–136)
@@ -237,8 +282,45 @@ def candidates_by_bpm(bpm: float | int | None) -> list[str]:
     return cands or SUBGENRES[:]
 
 
+def prerank_candidates(cands: list[str], feats: dict) -> list[str]:
+    """Reordena CANDIDATES com heurística simples baseada nas features."""
+    if not cands:
+        return cands
+
+    low = feats["low_pct"]; mid = feats["mid_pct"]; high = feats["high_pct"]
+    hp = feats["hp_ratio"]; on = feats["onset_strength"]
+
+    priority = []
+
+    # 1) Groove de pista seco / bass forte → Tech House / Minimal / Bass House
+    if low >= 45 and hp <= 1.10 and on >= 0.65:
+        priority += ["Tech House", "Minimal Bass (Tech House)", "Bass House", "Brazilian Bass"]
+
+    # 2) Brilho/impacto com equilíbrio harmônico → Progressive EDM / Big Room / Peak Time
+    if high >= 28 and 0.9 <= hp <= 1.2 and on >= 0.70:
+        priority += ["Progressive EDM", "Big Room", "Peak Time Techno", "Future House"]
+
+    # 3) Melódico/atmosférico → Melodic Techno / Prog Trance / Uplifting
+    if hp > 1.2 and mid >= 38:
+        priority += ["Melodic Techno", "Progressive Trance", "Uplifting Trance"]
+
+    # Anti-viés Indie Dance (só se muito coerente)
+    if not (feats["bpm"] <= 125 and on <= 0.60 and hp >= 1.10):
+        if "Indie Dance" in cands:
+            # joga para o fim se não cumprir critérios
+            cands = [x for x in cands if x != "Indie Dance"] + ["Indie Dance"]
+
+    # Dedup mantendo ordem: priority primeiro, depois o resto
+    seen = set()
+    ordered = []
+    for x in priority + cands:
+        if x in cands and x not in seen:
+            ordered.append(x); seen.add(x)
+    return ordered
+
+
 # ==============================
-# CHAMADA GPT
+# PROMPT + GPT
 # ==============================
 
 PROMPT = """
@@ -262,6 +344,11 @@ Interprete as FEATURES pelos intervalos típicos:
   • 0.5–0.7 → fluido/progressivo (Prog/Melodic)
   • 0.7–1.0 → batida seca/direta (Tech House/Peak/Hard)
 
+Regras adicionais:
+- Não escolha "Indie Dance" a menos que BPM ≤ 125, onset_strength ≤ 0.60 e hp_ratio ≥ 1.10.
+- Se houver conflito entre rótulos melódicos (Melodic/Trance) e rótulos percussivos (Tech House/Peak/Hard),
+  use hp_ratio como desempate: hp_ratio alto favorece Melodic/Trance; hp_ratio baixo favorece Tech/Hard.
+
 Responda em UMA linha, exatamente:
 Subgênero: <um valor presente em CANDIDATES>
 """.strip()
@@ -272,7 +359,6 @@ def call_gpt(features: dict, candidates: list[str]) -> str:
 
     # Tipos nativos
     features = {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v) for k, v in features.items()}
-
     payload = {"FEATURES": features, "CANDIDATES": candidates}
     user_message = (
         "Classifique usando APENAS um rótulo presente em CANDIDATES, com base em FEATURES.\n\n"
@@ -298,7 +384,7 @@ def call_gpt(features: dict, candidates: list[str]) -> str:
 # FASTAPI
 # ==============================
 
-app = FastAPI(title="SaaSDJ Backend v1.4 – Musical")
+app = FastAPI(title="SaaSDJ Backend v1.5 – Musical")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -308,12 +394,12 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "saasdj-backend", "version": "v1.4"}
+    return {"ok": True, "service": "saasdj-backend", "version": "v1.5"}
 
 
 @app.post("/classify")
 async def classify(file: UploadFile = File(...)):
-    """Classifica uma faixa em um subgênero eletrônico (base musical)."""
+    """Classifica faixa em um subgênero eletrônico (resposta: arquivo, bpm, subgenero)."""
     try:
         if not file.filename.lower().endswith((".mp3", ".wav")):
             raise HTTPException(status_code=400, detail="Envie arquivos .mp3 ou .wav")
@@ -322,11 +408,12 @@ async def classify(file: UploadFile = File(...)):
         if not data:
             raise HTTPException(status_code=400, detail="Arquivo vazio")
 
-        segment, sr, _ = load_audio_center_segment(data)
-        feats = extract_features(segment, sr)
+        samples, sr = load_audio(data)
+        feats = extract_features_from_best_window(samples, sr)
 
-        # Filtra candidatos plausíveis por BPM
+        # Candidatos por BPM + pré-ranque
         cands = candidates_by_bpm(feats["bpm"])
+        cands = prerank_candidates(cands, feats)
 
         try:
             response = call_gpt(feats, cands)
@@ -341,7 +428,7 @@ async def classify(file: UploadFile = File(...)):
                 sub = line.split(":", 1)[1].strip()
                 break
 
-        # Se vier fora da lista (ou não vier), usa fallback simples: 1º candidato
+        # Fallback: se não vier ou vier fora do set, pega 1º candidato pós-pré-ranque
         if not sub or sub not in SUBGENRES or sub not in cands:
             sub = cands[0] if cands else "Subgênero Não Identificado"
 
