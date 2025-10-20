@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-SaaSDJ Backend v1.5 – 3 janelas + pré-ranque de candidatos
+SaaSDJ Backend v1.6 – 3 janelas + BPM máximo + heurística de pré-ranque
 
-Mudanças (focadas e pequenas):
-- Analisa 3 janelas de 30s (início, centro, fim)
-- Escolhe a janela com mais "punch de pista" (onset + percussivo)
-- Pré-ranqueia CANDIDATES por heurísticas simples (EDM/Tech House/Minimal vs Melodic/Trance)
-- Prompt com guard-rails (evitar "Indie Dance" indevido)
+Mudanças principais:
+- 3 janelas de 30s (início ~1:00, centro, fim)
+- BPM final = maior BPM entre as janelas (mitiga breakdowns)
+- Janela de análise = maior "punch de pista" (onset + percussivo)
+- Heurística de pré-ranque afinada (Tech/Minimal vs EDM vs Melodic vs Hard)
 """
 
 import os
@@ -70,7 +70,7 @@ def slice_windows(samples: np.ndarray, sr: int, seg_dur: float = 30.0):
     total_sec = n / sr
     L = int(seg_dur * sr)
 
-    # Janela A: início (tenta 0:45–1:15; se a música for curta, começa no 0)
+    # Janela A: início (~0:45)
     a_start_sec = 45.0
     if total_sec < 75.0:
         a_start = 0
@@ -98,7 +98,7 @@ def slice_windows(samples: np.ndarray, sr: int, seg_dur: float = 30.0):
 
 
 # ==============================
-# FEATURES
+# FEATURES BÁSICAS
 # ==============================
 
 def _bpm_from_segment(segment: np.ndarray, sr: int) -> float | None:
@@ -110,14 +110,14 @@ def _bpm_from_segment(segment: np.ndarray, sr: int) -> float | None:
     except Exception:
         onset_env = np.array([], dtype=np.float32)
 
-    bpm_list = []
+    bpms = []
 
     # A) média de tempos do onset_env
     if onset_env.size:
         try:
             tempos = librosa.beat.tempo(onset_envelope=onset_env, sr=sr, aggregate=None)
             if tempos is not None and len(tempos) > 0:
-                bpm_list.append(float(np.mean(tempos)))
+                bpms.append(float(np.mean(tempos)))
         except Exception:
             pass
 
@@ -125,18 +125,18 @@ def _bpm_from_segment(segment: np.ndarray, sr: int) -> float | None:
     try:
         tempo_bt, _ = librosa.beat.beat_track(y=segment, sr=sr)
         if tempo_bt and float(tempo_bt) > 0:
-            bpm_list.append(float(tempo_bt))
+            bpms.append(float(tempo_bt))
     except Exception:
         pass
 
-    if not bpm_list:
+    if not bpms:
         return None
 
-    # half-time fix
-    bpm_list = [x * 2.0 if x < 90.0 else x for x in bpm_list]
+    # correção half-time
+    bpms = [x * 2.0 if x < 90.0 else x for x in bpms]
 
-    # escolher a mais perto de bandas comuns
-    bands = [(124, 130), (130, 138), (136, 142), (150, 160), (170, 178)]
+    # snap leve a bandas comuns (para estabilidade)
+    bands = [(124, 130), (130, 138), (136, 142), (140, 160), (170, 178)]
     def dist_to_bands(x: float) -> float:
         best = float("inf")
         for a, b in bands:
@@ -145,7 +145,7 @@ def _bpm_from_segment(segment: np.ndarray, sr: int) -> float | None:
             best = min(best, abs(x - a), abs(x - b))
         return best
 
-    return min(bpm_list, key=dist_to_bands)
+    return min(bpms, key=dist_to_bands)
 
 
 def _onset_strength(segment: np.ndarray, sr: int) -> float:
@@ -186,43 +186,55 @@ def _energy_bands(segment: np.ndarray, sr: int):
         return 33.33, 33.33, 33.34
 
 
-def pick_best_window(wins: list[np.ndarray], sr: int) -> tuple[np.ndarray, dict]:
-    """
-    Escolhe a janela com mais 'punch de pista':
-      score = 0.6*onset_strength + 0.4*(1/(1+1/hp_ratio_norm))
-    onde hp_ratio_norm favorece conteúdo percussivo moderado a forte.
-    """
-    best_idx, best_score, best_feats = 0, -1.0, None
-    for i, w in enumerate(wins):
+# ==============================
+# ESCOLHA DA JANELA + BPM GLOBAL
+# ==============================
+
+def _window_punch_score(hp_ratio: float, onset: float) -> float:
+    # favorece percussivo + batida “seca”: hp baixo + onset alto
+    perc_gain = max(0.0, min(1.0, 1.5 - hp_ratio))  # hp=0.8→0.7 ; hp=1.2→0.3
+    return 0.6 * onset + 0.4 * perc_gain
+
+
+def extract_features_from_best_window(samples: np.ndarray, sr: int) -> dict:
+    wins = slice_windows(samples, sr, seg_dur=30.0)
+
+    # Calcula features por janela e guarda bpm de todas
+    best = None
+    best_score = -1.0
+    bpm_candidates = []
+
+    for w in wins:
         if w.size == 0:
             continue
+        bpm = _bpm_from_segment(w, sr)
+        if bpm is not None:
+            # half-time já corrigido
+            bpm_candidates.append(bpm)
+
         hp = _hp_ratio(w)
         on = _onset_strength(w, sr)
-        # percussivo favorecido quando hp_ratio baixo; construir um ganho simples:
-        # mapeia hp em [0.5..1.5+] para [1.0 .. 0.5]
-        perc_gain = max(0.0, min(1.0, 1.5 - hp))  # hp=0.8 -> 0.7 ; hp=1.2 -> 0.3
-        score = 0.6 * on + 0.4 * perc_gain
+        low, mid, high = _energy_bands(w, sr)
 
+        score = _window_punch_score(hp, on)
         if score > best_score:
-            # calc features provisórias
-            bpm = _bpm_from_segment(w, sr) or 128.0
-            low, mid, high = _energy_bands(w, sr)
-            best_idx, best_score = i, score
-            best_feats = {
-                "bpm": int(round(bpm)),
+            best_score = score
+            best = {
                 "low_pct": float(low),
                 "mid_pct": float(mid),
                 "high_pct": float(high),
                 "hp_ratio": float(hp),
                 "onset_strength": float(on),
             }
-    return wins[best_idx], best_feats
 
+    # BPM global = MAIOR bpm entre janelas (minimiza subestimativa por breakdown)
+    if bpm_candidates:
+        bpm_final = int(round(max(bpm_candidates)))
+    else:
+        bpm_final = 128
 
-def extract_features_from_best_window(samples: np.ndarray, sr: int) -> dict:
-    wins = slice_windows(samples, sr, seg_dur=30.0)
-    _, feats = pick_best_window(wins, sr)
-    return feats
+    best["bpm"] = bpm_final
+    return best
 
 
 # ==============================
@@ -258,21 +270,21 @@ def candidates_by_bpm(bpm: float | int | None) -> list[str]:
             "Acid Techno","Detroit Techno","Progressive House","Progressive EDM","Big Room"
         ])
 
-    # Trance (134–142)
+    # Trance (132–144)
     if 132 <= b <= 144:
         add([
             "Progressive Trance","Uplifting Trance","Psytrance","Dark Psytrance",
             "Melodic Techno","Peak Time Techno"
         ])
 
-    # Hard Techno / Hard Dance (145–165)
-    if 142 <= b <= 166:
+    # Hard Techno / Hard Dance (140–165)  ← começa em 140 para não perder casos na borda
+    if 140 <= b <= 165:
         add([
             "Hard Techno","Hardstyle","Rawstyle","Jumpstyle","UK/Happy Hardcore","Gabber Hardcore"
         ])
 
     # Dubstep (half-time ~140)
-    if 134 <= b <= 146:
+    if 136 <= b <= 146:
         add(["Dubstep"])
 
     # Drum & Bass (170–180)
@@ -287,27 +299,31 @@ def prerank_candidates(cands: list[str], feats: dict) -> list[str]:
     if not cands:
         return cands
 
+    bpm = feats["bpm"]
     low = feats["low_pct"]; mid = feats["mid_pct"]; high = feats["high_pct"]
     hp = feats["hp_ratio"]; on = feats["onset_strength"]
 
     priority = []
 
-    # 1) Groove de pista seco / bass forte → Tech House / Minimal / Bass House
-    if low >= 45 and hp <= 1.10 and on >= 0.65:
+    # A) Tech House / Minimal / Bass House (kick/sub forte, pouco brilho)
+    if low >= 42 and hp <= 1.10 and high <= 30 and on >= 0.60:
         priority += ["Tech House", "Minimal Bass (Tech House)", "Bass House", "Brazilian Bass"]
 
-    # 2) Brilho/impacto com equilíbrio harmônico → Progressive EDM / Big Room / Peak Time
-    if high >= 28 and 0.9 <= hp <= 1.2 and on >= 0.70:
+    # B) EDM / Peak / Big Room (brilho/impacto com equilíbrio)
+    if high >= 24 and 0.9 <= hp <= 1.25 and on >= 0.65:
         priority += ["Progressive EDM", "Big Room", "Peak Time Techno", "Future House"]
 
-    # 3) Melódico/atmosférico → Melodic Techno / Prog Trance / Uplifting
-    if hp > 1.2 and mid >= 38:
+    # C) Melódico/Trance (só quando coerente; evita puxar tudo pra Melodic)
+    if hp >= 1.15 and mid >= 36 and on <= 0.80:
         priority += ["Melodic Techno", "Progressive Trance", "Uplifting Trance"]
 
-    # Anti-viés Indie Dance (só se muito coerente)
-    if not (feats["bpm"] <= 125 and on <= 0.60 and hp >= 1.10):
+    # D) Hard Techno (bordas)
+    if bpm >= 140 and hp <= 1.0 and low >= 40:
+        priority = ["Hard Techno"] + priority
+
+    # Anti-viés Indie Dance (só se combinar muito)
+    if not (bpm <= 125 and on <= 0.60 and hp >= 1.10):
         if "Indie Dance" in cands:
-            # joga para o fim se não cumprir critérios
             cands = [x for x in cands if x != "Indie Dance"] + ["Indie Dance"]
 
     # Dedup mantendo ordem: priority primeiro, depois o resto
@@ -330,24 +346,24 @@ Sua tarefa é escolher EXATAMENTE um subgênero dentre CANDIDATES. NÃO use rót
 
 Interprete as FEATURES pelos intervalos típicos:
 - BPM (faixas aproximadas): 118–126 (House/Indie), 124–130 (Tech House/Prog House/Melodic Techno),
-  128–136 (Techno pico), 134–142 (Trance), 145–165 (Hard Techno/Hard Dance), 170–180 (Drum & Bass).
+  128–136 (Techno pico), 132–144 (Trance), 140–165 (Hard Techno/Hard Dance), 170–180 (Drum & Bass).
 - Low/Mid/High (% energia):
   • Low alto (45–60%) → kick/bass fortes (Techno, Tech House)
   • Mid alto (35–50%) → melódico/progressivo (Melodic Techno, Progressive, Trance)
-  • High alto (25–40%) → brilho/hi-hats/impacto (EDM, Peak Time/Big Room)
+  • High alto (24–40%) → brilho/hi-hats/impacto (EDM, Peak Time/Big Room)
 - HP Ratio (harmônico/percussivo):
   • <0.9 → percussivo/seco (Techno/Hard)
-  • 0.9–1.2 → equilibrado (Tech House/Prog House/Peak Time)
-  • >1.2 → melódico/atmosférico (Melodic Techno/Prog/Uplifting)
+  • 0.9–1.2 → equilibrado (Tech House/Prog House/Peak/EDM)
+  • >1.2 → melódico/atmosférico (Melodic/Prog/Uplifting)
 - Onset strength:
   • 0.2–0.5 → grooves suaves (Deep/Indie)
   • 0.5–0.7 → fluido/progressivo (Prog/Melodic)
-  • 0.7–1.0 → batida seca/direta (Tech House/Peak/Hard)
+  • 0.7–1.0 → batida seca/direta (Tech/Peak/Hard)
 
 Regras adicionais:
 - Não escolha "Indie Dance" a menos que BPM ≤ 125, onset_strength ≤ 0.60 e hp_ratio ≥ 1.10.
-- Se houver conflito entre rótulos melódicos (Melodic/Trance) e rótulos percussivos (Tech House/Peak/Hard),
-  use hp_ratio como desempate: hp_ratio alto favorece Melodic/Trance; hp_ratio baixo favorece Tech/Hard.
+- Se houver conflito entre rótulos melódicos (Melodic/Trance) e rótulos percussivos (Tech/Hard/EDM),
+  use hp_ratio como desempate: hp_ratio alto favorece Melodic/Trance; hp_ratio baixo favorece Tech/Hard/EDM.
 
 Responda em UMA linha, exatamente:
 Subgênero: <um valor presente em CANDIDATES>
@@ -384,7 +400,7 @@ def call_gpt(features: dict, candidates: list[str]) -> str:
 # FASTAPI
 # ==============================
 
-app = FastAPI(title="SaaSDJ Backend v1.5 – Musical")
+app = FastAPI(title="SaaSDJ Backend v1.6 – Musical")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -394,7 +410,7 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "saasdj-backend", "version": "v1.5"}
+    return {"ok": True, "service": "saasdj-backend", "version": "v1.6"}
 
 
 @app.post("/classify")
