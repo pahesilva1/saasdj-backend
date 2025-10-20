@@ -1,17 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-SaaSDJ Backend v1.3 – Musical (inspirado no analisador assertivo)
+SaaSDJ Backend v1.4 – Musical (com candidates por BPM e resposta minimalista)
 
 Mudanças principais:
-✅ Janela fixa de 30s no centro da música (drop principal)
-✅ Features intuitivas e musicais:
-   - BPM
-   - Low / Mid / High energy %
-   - Onset Strength (força rítmica média)
-   - HP Ratio (harmônico/percussivo)
-✅ Prompt orientado a padrões musicais (interpretação semântica, não técnica)
-✅ Sem MFCC, centroid, bandwidth ou zcr (reduz ruído e melhora entendimento)
-✅ Leve, rápido e de alta assertividade
+- Janela fixa de 30s no centro da música (drop principal)
+- Features musicais: BPM, Low/Mid/High %, HP ratio, Onset strength
+- Filtro de candidatos por BPM (reduz ambiguidades)
+- Prompt força escolha APENAS dentro de CANDIDATES
+- Fallback seguro: se o GPT derrapar, usa o 1º candidato
 """
 
 import os
@@ -189,36 +185,46 @@ def extract_features(segment: np.ndarray, sr: int) -> dict:
     return features
 
 
-def candidates_by_bpm(bpm: float) -> list[str]:
+def candidates_by_bpm(bpm: float | int | None) -> list[str]:
+    """Retorna subgêneros plausíveis dado o BPM estimado (com janelas sobrepostas)."""
     if bpm is None:
-        return SUBGENRES[:]  # tudo, se não deu pra estimar
+        return SUBGENRES[:]
 
-    b = bpm
-    cands = []
+    b = float(bpm)
+    cands: list[str] = []
 
-    def add(xs): 
+    def add(xs):
         for x in xs:
-            if x not in cands: cands.append(x)
+            if x not in cands:
+                cands.append(x)
 
-    # House / Indie Dance (118–126)
+    # House / Indie (118–126)
     if 116 <= b <= 127:
-        add(["Deep House","Funky / Soulful House","Indie Dance","Progressive House",
-             "Tech House","Minimal Bass (Tech House)","Bass House","Brazilian Bass",
-             "Future House","Afro House","Melodic Techno","High-Tech Minimal","Detroit Techno"])
+        add([
+            "Deep House","Funky / Soulful House","Indie Dance","Progressive House",
+            "Tech House","Minimal Bass (Tech House)","Bass House","Brazilian Bass",
+            "Future House","Afro House","Melodic Techno","High-Tech Minimal","Detroit Techno"
+        ])
 
-    # Techno/Peak (126–136)
+    # Techno / Peak (126–136)
     if 124 <= b <= 138:
-        add(["Tech House","Peak Time Techno","High-Tech Minimal","Melodic Techno","Industrial Techno",
-             "Acid Techno","Detroit Techno","Progressive House","Progressive EDM","Big Room"])
+        add([
+            "Tech House","Peak Time Techno","High-Tech Minimal","Melodic Techno","Industrial Techno",
+            "Acid Techno","Detroit Techno","Progressive House","Progressive EDM","Big Room"
+        ])
 
     # Trance (134–142)
     if 132 <= b <= 144:
-        add(["Progressive Trance","Uplifting Trance","Psytrance","Dark Psytrance",
-             "Melodic Techno","Peak Time Techno"])
+        add([
+            "Progressive Trance","Uplifting Trance","Psytrance","Dark Psytrance",
+            "Melodic Techno","Peak Time Techno"
+        ])
 
-    # Hard Techno/Hard Dance (145–165)
+    # Hard Techno / Hard Dance (145–165)
     if 142 <= b <= 166:
-        add(["Hard Techno","Hardstyle","Rawstyle","Jumpstyle","UK/Happy Hardcore","Gabber Hardcore"])
+        add([
+            "Hard Techno","Hardstyle","Rawstyle","Jumpstyle","UK/Happy Hardcore","Gabber Hardcore"
+        ])
 
     # Dubstep (half-time ~140)
     if 134 <= b <= 146:
@@ -228,8 +234,8 @@ def candidates_by_bpm(bpm: float) -> list[str]:
     if 166 <= b <= 186:
         add(["Drum & Bass","Liquid DnB","Neurofunk"])
 
-    # se por acaso alguma janela caiu fora, ainda garante algo
     return cands or SUBGENRES[:]
+
 
 # ==============================
 # CHAMADA GPT
@@ -238,7 +244,7 @@ def candidates_by_bpm(bpm: float) -> list[str]:
 PROMPT = """
 Você é um especialista em música eletrônica.
 Receberá FEATURES de uma faixa e uma lista CANDIDATES de subgêneros plausíveis (filtrados por BPM).
-Sua tarefa é escolher EXATAMENTE **um** subgênero dentre CANDIDATES. NÃO use rótulos fora de CANDIDATES.
+Sua tarefa é escolher EXATAMENTE um subgênero dentre CANDIDATES. NÃO use rótulos fora de CANDIDATES.
 
 Interprete as FEATURES pelos intervalos típicos:
 - BPM (faixas aproximadas): 118–126 (House/Indie), 124–130 (Tech House/Prog House/Melodic Techno),
@@ -258,7 +264,7 @@ Interprete as FEATURES pelos intervalos típicos:
 
 Responda em UMA linha, exatamente:
 Subgênero: <um valor presente em CANDIDATES>
-"""
+""".strip()
 
 
 def call_gpt(features: dict, candidates: list[str]) -> str:
@@ -267,13 +273,9 @@ def call_gpt(features: dict, candidates: list[str]) -> str:
     # Tipos nativos
     features = {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v) for k, v in features.items()}
 
-    payload = {
-        "FEATURES": features,
-        "CANDIDATES": candidates,
-    }
-
+    payload = {"FEATURES": features, "CANDIDATES": candidates}
     user_message = (
-        "Classifique usando APENAS um rótulo presente em CANDIDATES, com base em FEATURES.\n"
+        "Classifique usando APENAS um rótulo presente em CANDIDATES, com base em FEATURES.\n\n"
         + json.dumps(payload, ensure_ascii=False, indent=2)
     )
 
@@ -296,7 +298,7 @@ def call_gpt(features: dict, candidates: list[str]) -> str:
 # FASTAPI
 # ==============================
 
-app = FastAPI(title="SaaSDJ Backend v1.3 – Musical")
+app = FastAPI(title="SaaSDJ Backend v1.4 – Musical")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -306,7 +308,7 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "saasdj-backend", "version": "v1.3"}
+    return {"ok": True, "service": "saasdj-backend", "version": "v1.4"}
 
 
 @app.post("/classify")
@@ -320,25 +322,28 @@ async def classify(file: UploadFile = File(...)):
         if not data:
             raise HTTPException(status_code=400, detail="Arquivo vazio")
 
-        segment, sr, dur = load_audio_center_segment(data)
+        segment, sr, _ = load_audio_center_segment(data)
         feats = extract_features(segment, sr)
 
+        # Filtra candidatos plausíveis por BPM
+        cands = candidates_by_bpm(feats["bpm"])
+
         try:
-            response = call_gpt(feats)
+            response = call_gpt(feats, cands)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Erro na API do GPT: {e}")
 
-        sub = "Subgênero Não Identificado"
-        explic = ""
+        # Parse: "Subgênero: X"
+        sub = None
         for line in response.splitlines():
             l = line.strip().lower()
             if l.startswith("subgênero:") or l.startswith("subgenero:"):
                 sub = line.split(":", 1)[1].strip()
-            elif l.startswith("explicação:") or l.startswith("explicacao:"):
-                explic = line.split(":", 1)[1].strip()
+                break
 
-        if sub not in SUBGENRES:
-            sub = "Subgênero Não Identificado"
+        # Se vier fora da lista (ou não vier), usa fallback simples: 1º candidato
+        if not sub or sub not in SUBGENRES or sub not in cands:
+            sub = cands[0] if cands else "Subgênero Não Identificado"
 
         return JSONResponse({
             "arquivo": file.filename,
