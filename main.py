@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-saasdj-backend (organizado v2)
+saasdj-backend (organizado v3)
 
 - FastAPI para classificar subgênero de música eletrônica a partir de .mp3/.wav
-- Extrai features com librosa (BPM robusto, bandas espectrais corrigidas, HP ratio, onset normalizado, kickband)
-- Usa regras numéricas + GPT para eleger o subgênero (sem "confidence")
-- Resposta SEMPRE inclui apenas: {"bpm": <int|None>, "subgenero": <str>}
+- Extrai features com librosa (BPM robusto focado no percussivo, bandas espectrais corrigidas,
+  HP ratio, onset normalizado, kickband)
+- Usa regras numéricas + GPT para eleger o subgênero
+- Resposta SEMPRE inclui: {"bpm": <int|None>, "subgenero": <str>, "analise": "<linha técnica>"}
 
 Requisitos mínimos (pip):
 fastapi uvicorn librosa soundfile pydub scipy requests python-multipart
@@ -81,7 +82,7 @@ SUBGENRES: List[str] = [
 ]
 
 # ---- SOFT RULES NUMÉRICAS (por subgênero) ----
-# Bandas corrigidas (proporções 0–1): low=20–250 Hz | mid=250–4000 Hz | high=4000–20000 Hz
+# Bandas (proporções 0–1): low=20–250 Hz | mid=250–4000 Hz | high=4000–20000 Hz
 # hp_ratio = H/P (harmônico ÷ percussivo); onset_strength = média normalizada do onset
 SOFT_RULES: Dict[str, Dict] = {
     # ---------------- HOUSE ----------------
@@ -94,8 +95,8 @@ SOFT_RULES: Dict[str, Dict] = {
     },
     "Tech House": {
         "bpm": (124, 128),
-        "bands_pct": {"low": (0.35, 0.60), "mid": (0.22, 0.40), "high": (0.12, 0.28)},
-        "hp_ratio": (0.75, 1.05),
+        "bands_pct": {"low": (0.35, 0.60), "mid": (0.22, 0.40), "high": (0.12, 0.35)},  # high max 0.35
+        "hp_ratio": (0.75, 1.25),  # era até 1.05
         "onset_strength": (0.40, 0.65),
         "signatures": "kick/bass secos e funcionais, grooves repetitivos, poucos leads",
     },
@@ -108,9 +109,9 @@ SOFT_RULES: Dict[str, Dict] = {
     },
     "Progressive House": {
         "bpm": (122, 128),
-        "bands_pct": {"low": (0.22, 0.40), "mid": (0.38, 0.58), "high": (0.15, 0.30)},
+        "bands_pct": {"low": (0.22, 0.40), "mid": (0.38, 0.58), "high": (0.15, 0.28)},  # high max 0.28
         "hp_ratio": (1.10, 1.70),
-        "onset_strength": (0.25, 0.50),
+        "onset_strength": (0.25, 0.50),  # mantém teto 0.50
         "signatures": "builds longos, atmosfera melódica, progressão constante/emotiva",
     },
     "Bass House": {
@@ -144,13 +145,13 @@ SOFT_RULES: Dict[str, Dict] = {
     "Afro House": {
         "bpm": (118, 125),
         "bands_pct": {"low": (0.25, 0.45), "mid": (0.35, 0.55), "high": (0.12, 0.28)},
-        "hp_ratio": (1.05, 1.60),
+        "hp_ratio": (1.05, 2.20),  # era até 1.60
         "onset_strength": (0.35, 0.60),
         "signatures": "percussões afro, groove orgânico, vocais/texturas étnicas",
     },
     "Indie Dance": {
         "bpm": (110, 125),
-        "bands_pct": {"low": (0.18, 0.35), "mid": (0.40, 0.60), "high": (0.12, 0.28)},
+        "bands_pct": {"low": (0.18, 0.35), "mid": (0.40, 0.60), "high": (0.12, 0.32)},  # high max 0.32
         "hp_ratio": (1.10, 1.80),
         "onset_strength": (0.25, 0.50),
         "signatures": "vibe retrô/alternativa, synths vintage, menos ênfase em transientes",
@@ -178,16 +179,16 @@ SOFT_RULES: Dict[str, Dict] = {
         "signatures": "texturas industriais/ruidosas, sensação ‘fábrica’, percussão pesada",
     },
     "Peak Time Techno": {
-        "bpm": (128, 132),
+        "bpm": (128, 134),  # era até 132
         "bands_pct": {"low": (0.32, 0.56), "mid": (0.24, 0.42), "high": (0.18, 0.35)},
         "hp_ratio": (0.85, 1.15),
         "onset_strength": (0.55, 0.80),
         "signatures": "4x4 direto para ápice; leads discretos; energia constante (ref. Victor Ruiz – All Night Long)",
     },
     "Hard Techno": {
-        "bpm": (135, 150),
+        "bpm": (135, 165),  # era até 150
         "bands_pct": {"low": (0.35, 0.60), "mid": (0.22, 0.40), "high": (0.22, 0.42)},
-        "hp_ratio": (0.70, 0.95),
+        "hp_ratio": (0.70, 1.30),  # era até 0.95
         "onset_strength": (0.65, 0.90),
         "signatures": "agressivo e percussivo; kicks duros; pouca melodia",
     },
@@ -200,8 +201,8 @@ SOFT_RULES: Dict[str, Dict] = {
     },
     "High-Tech Minimal": {
         "bpm": (124, 130),
-        "bands_pct": {"low": (0.32, 0.55), "mid": (0.22, 0.40), "high": (0.10, 0.25)},
-        "hp_ratio": (0.85, 1.15),
+        "bands_pct": {"low": (0.30, 0.58), "mid": (0.22, 0.40), "high": (0.10, 0.25)},  # low mais amplo
+        "hp_ratio": (0.85, 1.60),  # era até 1.15
         "onset_strength": (0.35, 0.60),
         "signatures": "minimalista, design sonoro detalhista; sub consistente, timbres enxutos",
     },
@@ -243,9 +244,9 @@ SOFT_RULES: Dict[str, Dict] = {
         "signatures": "drops marcados; dinâmica alta; hi-hats/brilho dando impacto",
     },
     "Progressive EDM": {
-        "bpm": (124, 128),
-        "bands_pct": {"low": (0.25, 0.45), "mid": (0.40, 0.60), "high": (0.15, 0.30)},
-        "hp_ratio": (1.10, 1.80),
+        "bpm": (126, 130),  # era 124–128
+        "bands_pct": {"low": (0.25, 0.45), "mid": (0.40, 0.60), "high": (0.25, 0.40)},  # high maior
+        "hp_ratio": (1.40, 2.20),  # mais melódico/brilhante
         "onset_strength": (0.35, 0.60),
         "signatures": "melódico de festival, polido, progressivo/pop-friendly",
     },
@@ -406,20 +407,26 @@ def _bands_energy(y: np.ndarray, sr: int) -> Tuple[float, float, float, float]:
 
 
 def _tempo_candidates(y: np.ndarray, sr: int) -> List[float]:
-    """Duas estimativas de BPM e vizinhos multiplicativos (x0.5, x1, x2)."""
+    """Estimativas de BPM focadas no componente percussivo (reduz viés melódico)."""
     bpms: List[float] = []
-
-    # 1) beat_track
     try:
-        tempo_bt, _ = librosa.beat.beat_track(y=y, sr=sr)
+        H, P = librosa.effects.hpss(y)
+    except Exception:
+        H, P = None, None
+
+    # 1) beat_track no percussivo (prioritário)
+    try:
+        y_for_tempo = P if P is not None and len(P) else y
+        tempo_bt, _ = librosa.beat.beat_track(y=y_for_tempo, sr=sr)
         if tempo_bt and tempo_bt > 0:
             bpms.append(float(tempo_bt))
     except Exception:
         pass
 
-    # 2) onset envelope + tempo
+    # 2) onset -> tempo no percussivo
     try:
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+        y_for_onset = P if P is not None and len(P) else y
+        onset_env = librosa.onset.onset_strength(y=y_for_onset, sr=sr)
         if onset_env is not None and len(onset_env):
             t = librosa.beat.tempo(onset_envelope=onset_env, sr=sr, max_tempo=200)
             if t is not None and len(t):
@@ -499,35 +506,48 @@ def extract_features(y: np.ndarray, sr: int) -> Dict[str, float | int | None]:
 
 
 def extract_features_multi(windows: Dict[str, Tuple[np.ndarray, int]]) -> Dict[str, float | int | None]:
-    """Combina 3 janelas: BPM pela mediana; demais features pela média."""
-    feats_list: List[Dict[str, float | int | None]] = []
-    for key in ["mid60", "center30", "last60"]:
+    """
+    Combina 3 janelas com PESOS:
+    mid60=0.2, center30=0.3, last60=0.5 (mais peso ao final).
+    BPM = mediana ponderada aproximada (via repetição por peso).
+    Demais = média ponderada.
+    """
+    order = [("mid60", 0.2), ("center30", 0.3), ("last60", 0.5)]
+    feats = []
+    for key, _w in order:
         y, sr = windows[key]
-        feats_list.append(extract_features(y, sr))
+        feats.append(extract_features(y, sr))
 
-    # BPM: mediana das não-nulas
-    bpms = [f["bpm"] for f in feats_list if f.get("bpm") is not None]
-    bpm = float(np.median(bpms)) if bpms else None
+    # BPM: "mediana ponderada" simples (replicando valores por peso*10)
+    bpm_values = []
+    for (key, w), f in zip(order, feats):
+        if f.get("bpm") is not None:
+            bpm_values += [f["bpm"]] * max(1, int(round(w * 10)))
+    bpm = float(np.median(bpm_values)) if bpm_values else None
 
-    # média simples pras demais
-    def avg(k: str):
-        vals = [f[k] for f in feats_list if f.get(k) is not None]
-        return float(np.mean(vals)) if vals else None
+    def wavg(k):
+        vals, ws = [], []
+        for (key, w), f in zip(order, feats):
+            v = f.get(k)
+            if v is not None:
+                vals.append(v); ws.append(w)
+        return float(np.average(vals, weights=ws)) if vals else None
 
     return {
         "bpm": round(bpm, 3) if bpm else None,
-        "energy_low": avg("energy_low"),
-        "energy_mid": avg("energy_mid"),
-        "energy_high": avg("energy_high"),
-        "kick_40_100": avg("kick_40_100"),
-        "low_pct": avg("low_pct"),
-        "mid_pct": avg("mid_pct"),
-        "high_pct": avg("high_pct"),
-        "hp_ratio": avg("hp_ratio"),
-        "onset_strength": avg("onset_strength"),
+        "energy_low": wavg("energy_low"),
+        "energy_mid": wavg("energy_mid"),
+        "energy_high": wavg("energy_high"),
+        "kick_40_100": wavg("kick_40_100"),
+        "low_pct": wavg("low_pct"),
+        "mid_pct": wavg("mid_pct"),
+        "high_pct": wavg("high_pct"),
+        "hp_ratio": wavg("hp_ratio"),
+        "onset_strength": wavg("onset_strength"),
     }
 
-# === BEGIN PATCH: helper da linha técnica ===
+
+# === Helper: linha técnica na resposta ===
 def _fmt_pct(x: float | None) -> str:
     return f"{x*100:.2f}%" if x is not None else "n/a"
 
@@ -565,23 +585,23 @@ def build_tech_line(
         f"source={decision_source}",
     ]
     return "; ".join(parts)
-# === END PATCH: helper da linha técnica ===
+
 
 # =============================================================================
 # Seleção de candidatos e fallback (backend)
 # =============================================================================
 
 def candidates_by_bpm(bpm: float | None) -> List[str]:
-    """Seleciona candidatos pela faixa de BPM com margem adaptativa."""
+    """Seleciona candidatos pela faixa de BPM com margens mais duras (2→3)."""
     if bpm is None:
         return list(SOFT_RULES.keys())
 
-    for margin in (3.0, 4.0):  # tenta 3, depois relaxa para 4
-        cands: List[str] = []
-        for name, meta in SOFT_RULES.items():
-            lo, hi = meta["bpm"]
-            if (bpm >= lo - margin) and (bpm <= hi + margin):
-                cands.append(name)
+    def in_margin(b, rng, m):
+        lo, hi = rng
+        return (b >= lo - m) and (b <= hi + m)
+
+    for margin in (2.0, 3.0):
+        cands = [name for name, meta in SOFT_RULES.items() if in_margin(bpm, meta["bpm"], margin)]
         if cands:
             return cands
     return list(SOFT_RULES.keys())
@@ -621,9 +641,9 @@ def backend_fallback_best_candidate(features: Dict[str, float | int | None], can
         bands_avg = (s_low + s_mid + s_high) / 3.0
         score = 0.45 * s_bpm + 0.40 * bands_avg + 0.15 * s_hp
 
-        # desempate leve pró gêneros “de pista” quando kick forte:
-        if name in ("Tech House", "Peak Time Techno", "Minimal Bass (Tech House)", "Hard Techno") and kick > 0:
-            score *= 1.02
+        # bônus suave se o kick está forte (gêneros 4x4 voltados à pista)
+        if name in ("Tech House", "Peak Time Techno", "Minimal Bass (Tech House)", "Hard Techno", "High-Tech Minimal") and kick > 0:
+            score *= 1.03  # leve viés pró pista
 
         if score > best_score:
             best_score = score
@@ -674,7 +694,7 @@ def format_rules_for_candidates(cands: List[str]) -> str:
 
 PROMPT = """
 Você é um especialista em música eletrônica. Classifique a faixa com base nas FEATURES abaixo.
-As features vêm de três janelas (mid60, center30, last60) agregadas por mediana/média.
+As features vêm de três janelas (mid60, center30, last60) agregadas por mediana/média ponderada (mais peso no final).
 
 REGRAS:
 - Use APENAS um subgênero dentre CANDIDATES.
@@ -729,7 +749,7 @@ def call_gpt(features: Dict[str, float | int | None], candidates: List[str]) -> 
 # FastAPI
 # =============================================================================
 
-app = FastAPI(title="saasdj-backend (organizado v2)")
+app = FastAPI(title="saasdj-backend (organizado v3)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -741,13 +761,15 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "saasdj-backend", "version": "v2"}
+    return {"ok": True, "service": "saasdj-backend", "version": "v3"}
+
 
 @app.post("/classify")
 async def classify(file: UploadFile = File(...)):
     """
     Recebe um .mp3/.wav, extrai features e classifica.
-    Retorno: {
+    Retorno:
+    {
       "bpm": <int|None>,
       "subgenero": <str>,
       "analise": "BPM=...; low%=...; mid%=...; high%=...; hp=...; onset=...; kick=...; cands=[...]; chosen=...; source=llm|fallback"
@@ -778,10 +800,7 @@ async def classify(file: UploadFile = File(...)):
             fb_sub = backend_fallback_best_candidate(feats, cands)
             bpm_int = int(round(bpm_val)) if bpm_val is not None else None
 
-            # fonte da decisão
             decision_source = "fallback"
-
-            # monta a linha técnica SEMPRE
             tech_line = build_tech_line(
                 feats=feats,
                 cands=cands,
@@ -793,8 +812,8 @@ async def classify(file: UploadFile = File(...)):
                 status_code=502,
                 content={
                     "bpm": bpm_int,
-                    "subgenero": fb_sub if fb_sub in SUBGENRES else "Subgênero Não Identificado",
-                    "analise": tech_line,  # linha técnica sempre presente
+                    "subgenero": fb_sub if fb_sub in SUBGENROS else "Subgênero Não Identificado",
+                    "analise": tech_line,
                     "error": str(e),
                 },
             )
@@ -832,7 +851,7 @@ async def classify(file: UploadFile = File(...)):
         return {
             "bpm": bpm_out,
             "subgenero": sub,
-            "analise": tech_line,  # linha técnica sempre presente
+            "analise": tech_line,
         }
 
     except HTTPException as he:
@@ -845,23 +864,19 @@ async def classify(file: UploadFile = File(...)):
             "error": f"processing failed: {e.__class__.__name__}: {e}",
         }
         try:
-            # Se já tínhamos feats/cands, gera a linha técnica mínima
             bpm_val = locals().get("bpm_val", None)
             feats = locals().get("feats", None)
             cands = locals().get("cands", [])
             if feats:
                 bpm_out = int(round(bpm_val)) if bpm_val is not None else None
-                chosen = "Subgênero Não Identificado"
-                decision_source = "fallback-error"
                 tech_line = build_tech_line(
                     feats=feats,
                     cands=cands if cands else list(SOFT_RULES.keys()),
-                    chosen=chosen,
-                    decision_source=decision_source,
+                    chosen="Subgênero Não Identificado",
+                    decision_source="fallback-error",
                 )
                 payload.update({"bpm": bpm_out, "analise": tech_line})
         except Exception:
             pass
 
         return JSONResponse(status_code=500, content=payload)
-
