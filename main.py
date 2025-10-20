@@ -76,129 +76,205 @@ def load_audio_center_segment(file_bytes: bytes, sr: int = 22050, segment_durati
 
 
 def extract_features(segment: np.ndarray, sr: int) -> dict:
-    """Extrai BPM, distribuição espectral, HP ratio e força rítmica."""
-    # BPM
-    onset_env = librosa.onset.onset_strength(y=segment, sr=sr)
-    bpm = float(librosa.beat.tempo(onset_envelope=onset_env, sr=sr)[0])
-    if bpm < 90:
-        bpm *= 2  # corrige half-time
+    """
+    Extrai features musicais de um trecho mono:
+      - BPM (estimativa robusta com 2 métodos + correção half-time)
+      - Distribuição espectral (% Low/Mid/High)
+      - HP Ratio (Harmônico/ Percussivo) com fallback seguro
+      - Onset Strength (força rítmica média normalizada)
+    Retorna tipos nativos do Python.
+    """
+    # ---------------------------
+    # BPM (duas estimativas + escolha por bandas comuns)
+    # ---------------------------
+    try:
+        onset_env = librosa.onset.onset_strength(y=segment, sr=sr)
+    except Exception:
+        onset_env = np.array([], dtype=np.float32)
 
-    # FFT
-    spectrum = np.abs(rfft(segment))
-    freqs = np.fft.rfftfreq(len(segment), 1 / sr)
+    # Estimativa A: média do vetor de tempos (se existir)
+    bpm_a = None
+    if onset_env.size:
+        try:
+            tempos = librosa.beat.tempo(onset_envelope=onset_env, sr=sr, aggregate=None)
+            if tempos is not None and len(tempos) > 0:
+                bpm_a = float(np.mean(tempos))
+        except Exception:
+            bpm_a = None
 
-    low_band = (freqs >= 20) & (freqs < 250)
-    mid_band = (freqs >= 250) & (freqs < 4000)
-    high_band = (freqs >= 4000) & (freqs <= 20000)
+    # Estimativa B: beat_track direto
+    bpm_b = None
+    try:
+        tempo_bt, _ = librosa.beat.beat_track(y=segment, sr=sr)
+        if tempo_bt and float(tempo_bt) > 0:
+            bpm_b = float(tempo_bt)
+    except Exception:
+        bpm_b = None
 
-    low_energy = np.sum(spectrum[low_band])
-    mid_energy = np.sum(spectrum[mid_band])
-    high_energy = np.sum(spectrum[high_band])
-    total_energy = max(low_energy + mid_energy + high_energy, 1e-9)
+    # Corrige half-time e coleciona candidatas
+    candidates_bpm: list[float] = []
+    for v in (bpm_a, bpm_b):
+        if v is None:
+            continue
+        vv = v * 2.0 if v < 90.0 else v
+        candidates_bpm.append(vv)
 
-    low_pct = round((low_energy / total_energy) * 100, 2)
-    mid_pct = round((mid_energy / total_energy) * 100, 2)
-    high_pct = round((high_energy / total_energy) * 100, 2)
+    # Escolhe a mais próxima de bandas frequentes de música eletrônica
+    if candidates_bpm:
+        bands = [(124, 130), (130, 138), (136, 142), (150, 160), (170, 178)]
+        def dist_to_bands(x: float) -> float:
+            best = float("inf")
+            for a, b in bands:
+                if a <= x <= b:
+                    return 0.0
+                best = min(best, abs(x - a), abs(x - b))
+            return best
+        bpm_val = min(candidates_bpm, key=dist_to_bands)
+    else:
+        bpm_val = 128.0  # valor seguro padrão
 
-    # HPSS
-    harmonic, percussive = librosa.effects.hpss(segment)
-    hp_ratio = np.mean(np.abs(harmonic)) / np.mean(np.abs(percussive))
+    # ---------------------------
+    # FFT: distribuição de energia por bandas
+    # ---------------------------
+    try:
+        spectrum = np.abs(rfft(segment))
+        freqs = np.fft.rfftfreq(len(segment), 1.0 / sr)
 
-    # Força rítmica média
-    onset_strength = float(np.mean(onset_env) / np.max(onset_env))
+        low_band = (freqs >= 20) & (freqs < 250)
+        mid_band = (freqs >= 250) & (freqs < 4000)
+        high_band = (freqs >= 4000) & (freqs <= 20000)
 
+        low_energy = float(np.sum(spectrum[low_band]))
+        mid_energy = float(np.sum(spectrum[mid_band]))
+        high_energy = float(np.sum(spectrum[high_band]))
+
+        total_energy = max(low_energy + mid_energy + high_energy, 1e-9)
+        low_pct = float(round((low_energy / total_energy) * 100.0, 2))
+        mid_pct = float(round((mid_energy / total_energy) * 100.0, 2))
+        high_pct = float(round((high_energy / total_energy) * 100.0, 2))
+    except Exception:
+        low_pct, mid_pct, high_pct = 33.33, 33.33, 33.34  # fallback neutro
+
+    # ---------------------------
+    # HPSS: razão Harmônico/ Percussivo (com fallback)
+    # ---------------------------
+    try:
+        harmonic, percussive = librosa.effects.hpss(segment)
+        h_mean = float(np.mean(np.abs(harmonic))) if harmonic.size else 0.0
+        p_mean = float(np.mean(np.abs(percussive))) if percussive.size else 1e-8
+        hp_ratio = float(round((h_mean / p_mean) if p_mean > 0 else 1.0, 2))
+    except Exception:
+        hp_ratio = 1.0  # equilíbrio como fallback
+
+    # ---------------------------
+    # Onset Strength normalizado
+    # ---------------------------
+    if onset_env.size:
+        denom = float(np.max(onset_env)) if float(np.max(onset_env)) > 0 else 1.0
+        onset_strength = float(round(float(np.mean(onset_env)) / denom, 3))
+    else:
+        onset_strength = 0.0
+
+    # ---------------------------
+    # Saída (tipos nativos)
+    # ---------------------------
     features = {
-        "bpm": float(round(bpm)),
+        "bpm": int(round(bpm_val)),
         "low_pct": float(low_pct),
         "mid_pct": float(mid_pct),
         "high_pct": float(high_pct),
-        "hp_ratio": float(round(hp_ratio, 2)),
-        "onset_strength": float(round(onset_strength, 3)),
+        "hp_ratio": float(hp_ratio),
+        "onset_strength": float(onset_strength),
     }
     return features
 
+
+def candidates_by_bpm(bpm: float) -> list[str]:
+    if bpm is None:
+        return SUBGENRES[:]  # tudo, se não deu pra estimar
+
+    b = bpm
+    cands = []
+
+    def add(xs): 
+        for x in xs:
+            if x not in cands: cands.append(x)
+
+    # House / Indie Dance (118–126)
+    if 116 <= b <= 127:
+        add(["Deep House","Funky / Soulful House","Indie Dance","Progressive House",
+             "Tech House","Minimal Bass (Tech House)","Bass House","Brazilian Bass",
+             "Future House","Afro House","Melodic Techno","High-Tech Minimal","Detroit Techno"])
+
+    # Techno/Peak (126–136)
+    if 124 <= b <= 138:
+        add(["Tech House","Peak Time Techno","High-Tech Minimal","Melodic Techno","Industrial Techno",
+             "Acid Techno","Detroit Techno","Progressive House","Progressive EDM","Big Room"])
+
+    # Trance (134–142)
+    if 132 <= b <= 144:
+        add(["Progressive Trance","Uplifting Trance","Psytrance","Dark Psytrance",
+             "Melodic Techno","Peak Time Techno"])
+
+    # Hard Techno/Hard Dance (145–165)
+    if 142 <= b <= 166:
+        add(["Hard Techno","Hardstyle","Rawstyle","Jumpstyle","UK/Happy Hardcore","Gabber Hardcore"])
+
+    # Dubstep (half-time ~140)
+    if 134 <= b <= 146:
+        add(["Dubstep"])
+
+    # Drum & Bass (170–180)
+    if 166 <= b <= 186:
+        add(["Drum & Bass","Liquid DnB","Neurofunk"])
+
+    # se por acaso alguma janela caiu fora, ainda garante algo
+    return cands or SUBGENRES[:]
 
 # ==============================
 # CHAMADA GPT
 # ==============================
 
 PROMPT = """
-Você é um especialista em música eletrônica. 
-Receberá dados técnicos sobre uma faixa (BPM, proporção de energia em graves/médios/agudos, razão harmônica-percussiva e força rítmica).
-Sua tarefa é classificar a faixa em **um único subgênero** da lista abaixo.
+Você é um especialista em música eletrônica.
+Receberá FEATURES de uma faixa e uma lista CANDIDATES de subgêneros plausíveis (filtrados por BPM).
+Sua tarefa é escolher EXATAMENTE **um** subgênero dentre CANDIDATES. NÃO use rótulos fora de CANDIDATES.
 
-A resposta deve ser **apenas duas linhas**:
-Subgênero: <nome exato>
-Explicação: <1 frase curta explicando com base nos dados>
+Interprete as FEATURES pelos intervalos típicos:
+- BPM (faixas aproximadas): 118–126 (House/Indie), 124–130 (Tech House/Prog House/Melodic Techno),
+  128–136 (Techno pico), 134–142 (Trance), 145–165 (Hard Techno/Hard Dance), 170–180 (Drum & Bass).
+- Low/Mid/High (% energia):
+  • Low alto (45–60%) → kick/bass fortes (Techno, Tech House)
+  • Mid alto (35–50%) → melódico/progressivo (Melodic Techno, Progressive, Trance)
+  • High alto (25–40%) → brilho/hi-hats/impacto (EDM, Peak Time/Big Room)
+- HP Ratio (harmônico/percussivo):
+  • <0.9 → percussivo/seco (Techno/Hard)
+  • 0.9–1.2 → equilibrado (Tech House/Prog House/Peak Time)
+  • >1.2 → melódico/atmosférico (Melodic Techno/Prog/Uplifting)
+- Onset strength:
+  • 0.2–0.5 → grooves suaves (Deep/Indie)
+  • 0.5–0.7 → fluido/progressivo (Prog/Melodic)
+  • 0.7–1.0 → batida seca/direta (Tech House/Peak/Hard)
 
-Subgêneros possíveis:
-Deep House, Tech House, Minimal Bass (Tech House), Progressive House, Bass House,
-Funky / Soulful House, Brazilian Bass, Future House, Afro House, Indie Dance,
-Detroit Techno, Acid Techno, Industrial Techno, Peak Time Techno, Hard Techno,
-Melodic Techno, High-Tech Minimal, Uplifting Trance, Progressive Trance, Psytrance,
-Dark Psytrance, Big Room, Progressive EDM, Hardstyle, Rawstyle, Gabber Hardcore,
-UK/Happy Hardcore, Jumpstyle, Dubstep, Drum & Bass, Liquid DnB, Neurofunk.
-
----
-
-🎚️ Interprete as features com base em faixas musicais típicas (use **intervalos**, não valores fixos):
-
-🔹 **BPM (faixa aproximada)**
-- 118–125 → Deep / Funky / Soulful House, Indie Dance  
-- 124–130 → Tech House, Progressive House, Melodic Techno  
-- 128–136 → Techno (Peak Time, High-Tech, Melodic)  
-- 134–142 → Trance (Progressive, Uplifting, Psy)  
-- 145–160 → Hard Techno, Hard Dance  
-- 170–180 → Drum & Bass, Liquid, Neurofunk  
-
-🔹 **Low / Mid / High Energy (%)**
-- Low alto (45–60%) → estilos centrados no kick/bassline (Techno, Tech House)  
-- Mid alto (35–50%) → estilos melódicos e progressivos (Melodic Techno, Progressive House, Trance)  
-- High alto (25–40%) → estilos energéticos, com hi-hats e brilho (EDM, Peak Time Techno, Big Room)  
-
-🔹 **HP Ratio (Harmônico/Percussivo)**
-- < 0.9 → percussivo e seco → Hard Techno, Peak Time, Tech House  
-- 0.9–1.2 → equilibrado → Progressive House, Progressive EDM, Techno  
-- > 1.2 → melódico e atmosférico → Melodic Techno, Progressive Trance, Uplifting Trance  
-
-🔹 **Onset Strength (força rítmica)**
-- 0.2–0.5 → grooves suaves ou deep → Deep House, Indie Dance  
-- 0.5–0.7 → fluído → Progressive / Melodic estilos  
-- 0.7–1.0 → batida seca, direta → Tech House, Peak Time, Hard Techno  
-
----
-
-🎧 Exemplos referenciais (use como base de raciocínio, não como regra exata):
-
-- **Melodic Techno:** BPM ~122–128, hp_ratio >1.2, mid_pct alto (melodias e atmosferas progressivas)
-- **Hard Techno:** BPM 140–155, hp_ratio <0.9, low_pct alto (kick agressivo e pouca melodia)
-- **Uplifting Trance:** BPM 136–140, hp_ratio >1.2, mid_pct alto, high_pct moderado (melódico e eufórico)
-- **Tech House:** BPM 124–128, low_pct alto, hp_ratio 0.9–1.1, onset forte e groove seco
-- **Progressive House:** BPM 122–128, mid_pct e hp_ratio equilibrados, flow contínuo e harmônico
-- **Drum & Bass:** BPM 170–178, high_pct alto, hp_ratio baixo (ritmo frenético)
-
----
-
-⚙️ Instruções finais:
-1. Use **todos os dados juntos** — não confie apenas no BPM.  
-2. Se os dados parecerem ambíguos, escolha o subgênero **mais provável musicalmente**.  
-3. Se nada fizer sentido, retorne:
-Subgênero: Uncategorized Genre
-Explicação: Dados não coincidem claramente com nenhum subgênero.
+Responda em UMA linha, exatamente:
+Subgênero: <um valor presente em CANDIDATES>
 """
 
 
-def call_gpt(features: dict) -> str:
+def call_gpt(features: dict, candidates: list[str]) -> str:
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
-    # 🔧 Corrige tipos NumPy → Python
+    # Tipos nativos
     features = {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v) for k, v in features.items()}
 
-    # ✨ Contexto claro pro modelo entender os dados
+    payload = {
+        "FEATURES": features,
+        "CANDIDATES": candidates,
+    }
+
     user_message = (
-        "Esses são os dados técnicos extraídos de uma faixa de música eletrônica.\n"
-        "Analise e classifique com base no prompt anterior:\n\n"
-        f"{json.dumps(features, ensure_ascii=False, indent=2)}"
+        "Classifique usando APENAS um rótulo presente em CANDIDATES, com base em FEATURES.\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
     )
 
     data = {
@@ -207,14 +283,14 @@ def call_gpt(features: dict) -> str:
             {"role": "system", "content": PROMPT},
             {"role": "user", "content": user_message}
         ],
-        "temperature": 0.3,
+        "temperature": 0.0,
     }
 
     r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=data, timeout=60)
     if r.status_code != 200:
         raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:200]}")
-
     return r.json()["choices"][0]["message"]["content"].strip()
+
 
 # ==============================
 # FASTAPI
