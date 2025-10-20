@@ -527,6 +527,45 @@ def extract_features_multi(windows: Dict[str, Tuple[np.ndarray, int]]) -> Dict[s
         "onset_strength": avg("onset_strength"),
     }
 
+# === BEGIN PATCH: helper da linha técnica ===
+def _fmt_pct(x: float | None) -> str:
+    return f"{x*100:.2f}%" if x is not None else "n/a"
+
+def _fmt_float(x: float | None, nd=2) -> str:
+    return f"{x:.{nd}f}" if x is not None else "n/a"
+
+def build_tech_line(
+    feats: Dict[str, float | int | None],
+    cands: List[str],
+    chosen: str,
+    decision_source: str,
+) -> str:
+    """
+    Retorna UMA linha com os principais dados extraídos e contexto da decisão.
+    Ex.: BPM=128; low%=35.2%; mid%=44.1%; high%=20.7%; hp=1.12; onset=0.53; kick=1234567; cands=[Tech House,...]; chosen=Tech House; source=llm
+    """
+    bpm = feats.get("bpm")
+    low_pct = feats.get("low_pct")
+    mid_pct = feats.get("mid_pct")
+    high_pct = feats.get("high_pct")
+    hp = feats.get("hp_ratio")
+    onset = feats.get("onset_strength")
+    kick = feats.get("kick_40_100")
+
+    parts = [
+        f"BPM={int(round(bpm)) if bpm is not None else 'n/a'}",
+        f"low%={_fmt_pct(low_pct)}",
+        f"mid%={_fmt_pct(mid_pct)}",
+        f"high%={_fmt_pct(high_pct)}",
+        f"hp={_fmt_float(hp,2)}",
+        f"onset={_fmt_float(onset,2)}",
+        f"kick={int(kick) if kick is not None else 'n/a'}",
+        f"cands=[{', '.join(cands)}]",
+        f"chosen={chosen}",
+        f"source={decision_source}",
+    ]
+    return "; ".join(parts)
+# === END PATCH: helper da linha técnica ===
 
 # =============================================================================
 # Seleção de candidatos e fallback (backend)
@@ -704,12 +743,15 @@ app.add_middleware(
 def health():
     return {"ok": True, "service": "saasdj-backend", "version": "v2"}
 
-
 @app.post("/classify")
 async def classify(file: UploadFile = File(...)):
     """
-    Recebe um .mp3/.wav, extrai features e classifica:
-    Retorno: {"bpm": <int|None>, "subgenero": <str>}
+    Recebe um .mp3/.wav, extrai features e classifica.
+    Retorno: {
+      "bpm": <int|None>,
+      "subgenero": <str>,
+      "analise": "BPM=...; low%=...; mid%=...; high%=...; hp=...; onset=...; kick=...; cands=[...]; chosen=...; source=llm|fallback"
+    }
     """
     try:
         # Validação simples
@@ -735,11 +777,24 @@ async def classify(file: UploadFile = File(...)):
             # Falha na OpenAI — Fallback heurístico
             fb_sub = backend_fallback_best_candidate(feats, cands)
             bpm_int = int(round(bpm_val)) if bpm_val is not None else None
+
+            # fonte da decisão
+            decision_source = "fallback"
+
+            # monta a linha técnica SEMPRE
+            tech_line = build_tech_line(
+                feats=feats,
+                cands=cands,
+                chosen=fb_sub if fb_sub in SUBGENRES else "Subgênero Não Identificado",
+                decision_source=decision_source,
+            )
+
             return JSONResponse(
                 status_code=502,
                 content={
                     "bpm": bpm_int,
                     "subgenero": fb_sub if fb_sub in SUBGENRES else "Subgênero Não Identificado",
+                    "analise": tech_line,  # linha técnica sempre presente
                     "error": str(e),
                 },
             )
@@ -756,28 +811,57 @@ async def classify(file: UploadFile = File(...)):
             sub = "Subgênero Não Identificado"
 
         # 6) Fallback heurístico se o LLM não identificar
+        decision_source = "llm"
         if sub == "Subgênero Não Identificado":
             fb_sub = backend_fallback_best_candidate(feats, cands)
             if fb_sub != "Subgênero Não Identificado":
                 sub = fb_sub
+                decision_source = "fallback"
 
         # 7) BPM como INTEIRO na resposta (arredondado)
         bpm_out = int(round(bpm_val)) if bpm_val is not None else None
 
+        # 8) SEMPRE incluir a linha técnica "analise"
+        tech_line = build_tech_line(
+            feats=feats,
+            cands=cands,
+            chosen=sub,
+            decision_source=decision_source,
+        )
+
         return {
             "bpm": bpm_out,
             "subgenero": sub,
+            "analise": tech_line,  # linha técnica sempre presente
         }
 
     except HTTPException as he:
         raise he
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "bpm": None,
-                "subgenero": "Subgênero Não Identificado",
-                "error": f"processing failed: {e.__class__.__name__}: {e}",
-            },
-        )
+        # Erro inesperado: tenta enriquecer com o que for possível
+        payload = {
+            "bpm": None,
+            "subgenero": "Subgênero Não Identificado",
+            "error": f"processing failed: {e.__class__.__name__}: {e}",
+        }
+        try:
+            # Se já tínhamos feats/cands, gera a linha técnica mínima
+            bpm_val = locals().get("bpm_val", None)
+            feats = locals().get("feats", None)
+            cands = locals().get("cands", [])
+            if feats:
+                bpm_out = int(round(bpm_val)) if bpm_val is not None else None
+                chosen = "Subgênero Não Identificado"
+                decision_source = "fallback-error"
+                tech_line = build_tech_line(
+                    feats=feats,
+                    cands=cands if cands else list(SOFT_RULES.keys()),
+                    chosen=chosen,
+                    decision_source=decision_source,
+                )
+                payload.update({"bpm": bpm_out, "analise": tech_line})
+        except Exception:
+            pass
+
+        return JSONResponse(status_code=500, content=payload)
 
