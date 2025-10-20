@@ -161,6 +161,10 @@ Explicação: <1–3 frases musicais justificando sua escolha>
 
 def call_gpt(features: dict) -> str:
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    
+    # 🔧 Corrige tipos NumPy → Python
+    features = {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v) for k, v in features.items()}
+    
     data = {
         "model": MODEL,
         "messages": [
@@ -169,11 +173,11 @@ def call_gpt(features: dict) -> str:
         ],
         "temperature": 0.3,
     }
+
     r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=data, timeout=60)
     if r.status_code != 200:
         raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:200]}")
     return r.json()["choices"][0]["message"]["content"].strip()
-
 
 # ==============================
 # FASTAPI
