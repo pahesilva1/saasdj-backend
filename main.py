@@ -190,15 +190,22 @@ Explicação: Dados não coincidem claramente com nenhum subgênero.
 
 def call_gpt(features: dict) -> str:
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    
+
     # 🔧 Corrige tipos NumPy → Python
     features = {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v) for k, v in features.items()}
-    
+
+    # ✨ Contexto claro pro modelo entender os dados
+    user_message = (
+        "Esses são os dados técnicos extraídos de uma faixa de música eletrônica.\n"
+        "Analise e classifique com base no prompt anterior:\n\n"
+        f"{json.dumps(features, ensure_ascii=False, indent=2)}"
+    )
+
     data = {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": PROMPT},
-            {"role": "user", "content": json.dumps(features, ensure_ascii=False)}
+            {"role": "user", "content": user_message}
         ],
         "temperature": 0.3,
     }
@@ -206,6 +213,7 @@ def call_gpt(features: dict) -> str:
     r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=data, timeout=60)
     if r.status_code != 200:
         raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:200]}")
+
     return r.json()["choices"][0]["message"]["content"].strip()
 
 # ==============================
