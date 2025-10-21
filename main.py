@@ -95,7 +95,7 @@ SOFT_RULES: Dict[str, Dict] = {
     },
     "Tech House": {
         "bpm": (124, 128),
-        "bands_pct": {"low": (0.35, 0.60), "mid": (0.22, 0.40), "high": (0.12, 0.35)},  # high max 0.35
+        "bands_pct": {"low": (0.35, 0.60), "mid": (0.22, 0.40), "high": (0.12, 0.36)},  # high max 0.35
         "hp_ratio": (0.75, 1.25),  # era até 1.05
         "onset_strength": (0.40, 0.65),
         "signatures": "kick/bass secos e funcionais, grooves repetitivos, poucos leads",
@@ -179,7 +179,7 @@ SOFT_RULES: Dict[str, Dict] = {
         "signatures": "texturas industriais/ruidosas, sensação ‘fábrica’, percussão pesada",
     },
     "Peak Time Techno": {
-        "bpm": (128, 134),  # era até 132
+        "bpm": (128, 136),  # era até 132
         "bands_pct": {"low": (0.32, 0.56), "mid": (0.24, 0.42), "high": (0.18, 0.35)},
         "hp_ratio": (0.85, 1.15),
         "onset_strength": (0.55, 0.80),
@@ -209,17 +209,17 @@ SOFT_RULES: Dict[str, Dict] = {
     # ---------------- TRANCE ----------------
     "Uplifting Trance": {
         "bpm": (134, 140),
-        "bands_pct": {"low": (0.22, 0.40), "mid": (0.40, 0.60), "high": (0.15, 0.32)},
-        "hp_ratio": (1.20, 2.00),
-        "onset_strength": (0.35, 0.60),
-        "signatures": "supersaws eufóricas, breakdowns grandes; absorve Vocal Trance eufórico",
+        "bands_pct": {"low": (0.22, 0.40), "mid": (0.38, 0.58), "high": (0.22, 0.38)},  # high mínimo 0.22 (↑)
+        "hp_ratio": (1.30, 2.20),  # ligeiro ↑
+        "onset_strength": (0.60, 0.90),  # ↑ mais impacto
+        "signatures": "...",
     },
     "Progressive Trance": {
         "bpm": (132, 138),
-        "bands_pct": {"low": (0.22, 0.40), "mid": (0.38, 0.60), "high": (0.15, 0.32)},
-        "hp_ratio": (1.10, 1.80),
-        "onset_strength": (0.25, 0.50),
-        "signatures": "atmosfera rolante; menos euforia que Uplifting; absorve Vocal Trance atmosférico",
+        "bands_pct": {"low": (0.22, 0.40), "mid": (0.40, 0.62), "high": (0.15, 0.26)},  # high máximo 0.26 (↓)
+        "hp_ratio": (1.10, 1.90),
+        "onset_strength": (0.25, 0.60),  # teto menor que Uplifting
+        "signatures": "...",
     },
     "Psytrance": {
         "bpm": (138, 146),
@@ -512,7 +512,7 @@ def extract_features_multi(windows: Dict[str, Tuple[np.ndarray, int]]) -> Dict[s
     BPM = mediana ponderada aproximada (via repetição por peso).
     Demais = média ponderada.
     """
-    order = [("mid60", 0.2), ("center30", 0.3), ("last60", 0.5)]
+    order = [("mid60", 0.15), ("center30", 0.25), ("last60", 0.60)]
     feats = []
     for key, _w in order:
         y, sr = windows[key]
@@ -644,7 +644,11 @@ def backend_fallback_best_candidate(features: Dict[str, float | int | None], can
         # bônus suave se o kick está forte (gêneros 4x4 voltados à pista)
         if name in ("Tech House", "Peak Time Techno", "Minimal Bass (Tech House)", "Hard Techno", "High-Tech Minimal") and kick > 0:
             score *= 1.03  # leve viés pró pista
-
+      
+      # desempate pró Melodic Techno quando bem melódica
+        if name == "Melodic Techno":
+            if (hpr >= 1.60) and (mp >= 0.45) and (120 <= (bpm or 0) <= 128):
+                score *= 1.04  # viés leve pró MT em casos "claros"
         if score > best_score:
             best_score = score
             best_name = name
@@ -812,7 +816,7 @@ async def classify(file: UploadFile = File(...)):
                 status_code=502,
                 content={
                     "bpm": bpm_int,
-                    "subgenero": fb_sub if fb_sub in SUBGENROS else "Subgênero Não Identificado",
+                    "subgenero": fb_sub if fb_sub in SUBGENRES else "Subgênero Não Identificado",
                     "analise": tech_line,
                     "error": str(e),
                 },
