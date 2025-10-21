@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-saasdj-backend (organizado v3)
+saasdj-backend (organizado v4 - nova taxonomia)
 
 - FastAPI para classificar subgênero de música eletrônica a partir de .mp3/.wav
 - Extrai features com librosa (BPM robusto focado no percussivo, bandas espectrais corrigidas,
-  HP ratio, onset normalizado, kickband)
+  HP ratio, onset normalizado, kickband, duração da faixa)
 - Usa regras numéricas + GPT para eleger o subgênero
 - Resposta SEMPRE inclui: {"bpm": <int|None>, "subgenero": <str>, "analise": "<linha técnica>"}
 
@@ -39,41 +39,42 @@ MODEL = os.getenv("MODEL", "gpt-4o")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY não configurada")
 
-# Lista oficial de subgêneros (universo permitido)
+# Lista oficial de subgêneros (universo permitido) — NOVA TAXONOMIA
 SUBGENRES: List[str] = [
     # House
     "Deep House",
     "Tech House",
-    "Minimal Bass (Tech House)",
     "Progressive House",
     "Bass House",
     "Funky / Soulful House",
     "Brazilian Bass",
-    "Future House",
     "Afro House",
     "Indie Dance",
-    # Techno
-    "Detroit Techno",
-    "Acid Techno",
-    "Industrial Techno",
+
+    # Techno / híbridos
+    "Old School Techno (Detroit/Acid/Industrial)",
     "Peak Time Techno",
     "Hard Techno",
-    "Melodic Techno",
     "High-Tech Minimal",
+    "Melodic House & Techno",
+
     # Trance
-    "Uplifting Trance",
-    "Progressive Trance",
+    "Melodic & Progressive Trance",
     "Psytrance",
     "Dark Psytrance",
+
     # EDM (Festival)
     "Big Room",
-    "Progressive EDM",
+    "Progressive EDM & Future House",
+
     # Hard Dance
     "Hardstyle",
     "Rawstyle",
     "Gabber Hardcore",
     "UK/Happy Hardcore",
     "Jumpstyle",
+    "Hard Dance/Groove",
+
     # Bass Music
     "Dubstep",
     "Drum & Bass",
@@ -83,143 +84,110 @@ SUBGENRES: List[str] = [
 
 # ---- SOFT RULES NUMÉRICAS (por subgênero) ----
 # Bandas (proporções 0–1): low=20–250 Hz | mid=250–4000 Hz | high=4000–20000 Hz
-# hp_ratio = H/P (harmônico ÷ percussivo); onset_strength = média normalizada do onset
+# hp_ratio = H/P (harmônico ÷ percussivo); onset_strength = média/STD do onset (normalizada)
 SOFT_RULES: Dict[str, Dict] = {
     # ---------------- HOUSE ----------------
     "Deep House": {
         "bpm": (120, 124),
         "bands_pct": {"low": (0.20, 0.35), "mid": (0.40, 0.60), "high": (0.10, 0.25)},
-        "hp_ratio": (1.10, 1.80),
+        "hp_ratio": (1.10, 1.90),
         "onset_strength": (0.20, 0.50),
         "signatures": "groove suave/profundo, acordes/pads, vocais quentes; menos foco em transientes",
     },
     "Tech House": {
         "bpm": (124, 128),
-        "bands_pct": {"low": (0.35, 0.60), "mid": (0.22, 0.40), "high": (0.12, 0.36)},  # high max 0.35
-        "hp_ratio": (0.75, 1.25),  # era até 1.05
+        "bands_pct": {"low": (0.35, 0.60), "mid": (0.20, 0.40), "high": (0.12, 0.36)},
+        "hp_ratio": (0.75, 1.25),
         "onset_strength": (0.40, 0.65),
         "signatures": "kick/bass secos e funcionais, grooves repetitivos, poucos leads",
     },
-    "Minimal Bass (Tech House)": {
-        "bpm": (124, 128),
-        "bands_pct": {"low": (0.45, 0.68), "mid": (0.16, 0.32), "high": (0.08, 0.22)},
-        "hp_ratio": (0.70, 0.95),
-        "onset_strength": (0.35, 0.60),
-        "signatures": "sub muito forte e arranjo minimalista; foco no baixo e groove enxuto",
-    },
     "Progressive House": {
         "bpm": (122, 128),
-        "bands_pct": {"low": (0.22, 0.40), "mid": (0.38, 0.58), "high": (0.15, 0.28)},  # high max 0.28
-        "hp_ratio": (1.10, 1.70),
-        "onset_strength": (0.25, 0.50),  # mantém teto 0.50
-        "signatures": "builds longos, atmosfera melódica, progressão constante/emotiva",
+        "bands_pct": {"low": (0.22, 0.40), "mid": (0.38, 0.60), "high": (0.12, 0.28)},
+        "hp_ratio": (1.10, 1.80),
+        "onset_strength": (0.25, 0.55),
+        "signatures": "builds longos, atmosfera melódica, progressão constante/emotiva (faixas geralmente >5min)",
     },
     "Bass House": {
         "bpm": (124, 128),
-        "bands_pct": {"low": (0.45, 0.70), "mid": (0.20, 0.40), "high": (0.18, 0.35)},
-        "hp_ratio": (0.80, 1.10),
+        "bands_pct": {"low": (0.45, 0.75), "mid": (0.18, 0.40), "high": (0.18, 0.38)},
+        "hp_ratio": (0.80, 1.20),
         "onset_strength": (0.45, 0.70),
         "signatures": "basslines agressivas/‘talking’, queda forte no drop (absorve Electro House)",
     },
     "Funky / Soulful House": {
         "bpm": (120, 125),
         "bands_pct": {"low": (0.25, 0.40), "mid": (0.40, 0.60), "high": (0.10, 0.25)},
-        "hp_ratio": (1.10, 1.80),
+        "hp_ratio": (1.10, 1.90),
         "onset_strength": (0.20, 0.45),
         "signatures": "instrumentação orgânica, elementos soul/disco, presença de vocais",
     },
     "Brazilian Bass": {
         "bpm": (120, 126),
-        "bands_pct": {"low": (0.50, 0.75), "mid": (0.18, 0.35), "high": (0.08, 0.22)},
-        "hp_ratio": (0.80, 1.10),
+        "bands_pct": {"low": (0.50, 0.78), "mid": (0.16, 0.35), "high": (0.08, 0.22)},
+        "hp_ratio": (0.80, 1.20),
         "onset_strength": (0.35, 0.60),
         "signatures": "sub/slap marcante com groove pop-friendly, vocais ocasionais",
     },
-    "Future House": {
-        "bpm": (124, 128),
-        "bands_pct": {"low": (0.35, 0.55), "mid": (0.22, 0.40), "high": (0.20, 0.38)},
-        "hp_ratio": (0.95, 1.25),
-        "onset_strength": (0.45, 0.70),
-        "signatures": "timbres ‘future’/serrilhas, drops claros e brilhantes",
-    },
     "Afro House": {
         "bpm": (118, 125),
-        "bands_pct": {"low": (0.25, 0.45), "mid": (0.35, 0.55), "high": (0.12, 0.28)},
-        "hp_ratio": (1.05, 2.20),  # era até 1.60
+        "bands_pct": {"low": (0.25, 0.45), "mid": (0.35, 0.58), "high": (0.12, 0.28)},
+        "hp_ratio": (1.05, 2.20),
         "onset_strength": (0.35, 0.60),
         "signatures": "percussões afro, groove orgânico, vocais/texturas étnicas",
     },
     "Indie Dance": {
         "bpm": (110, 125),
-        "bands_pct": {"low": (0.18, 0.35), "mid": (0.40, 0.60), "high": (0.12, 0.32)},  # high max 0.32
-        "hp_ratio": (1.10, 1.80),
+        "bands_pct": {"low": (0.18, 0.35), "mid": (0.40, 0.60), "high": (0.12, 0.32)},
+        "hp_ratio": (1.10, 1.90),
         "onset_strength": (0.25, 0.50),
         "signatures": "vibe retrô/alternativa, synths vintage, menos ênfase em transientes",
     },
-    # ---------------- TECHNO ----------------
-    "Detroit Techno": {
-        "bpm": (122, 130),
-        "bands_pct": {"low": (0.28, 0.45), "mid": (0.30, 0.50), "high": (0.12, 0.28)},
-        "hp_ratio": (0.90, 1.30),
-        "onset_strength": (0.40, 0.65),
-        "signatures": "groove clássico/analógico, estética quente, linhas repetitivas",
-    },
-    "Acid Techno": {
-        "bpm": (125, 135),
-        "bands_pct": {"low": (0.28, 0.45), "mid": (0.35, 0.55), "high": (0.15, 0.32)},
-        "hp_ratio": (0.95, 1.30),
-        "onset_strength": (0.45, 0.70),
-        "signatures": "timbre TB-303 em destaque (ressonante/squelch) como elemento central",
-    },
-    "Industrial Techno": {
-        "bpm": (128, 140),
-        "bands_pct": {"low": (0.35, 0.60), "mid": (0.22, 0.40), "high": (0.20, 0.40)},
-        "hp_ratio": (0.75, 1.05),
-        "onset_strength": (0.60, 0.85),
-        "signatures": "texturas industriais/ruidosas, sensação ‘fábrica’, percussão pesada",
+
+    # ---------------- TECHNO / HÍBRIDOS ----------------
+    "Old School Techno (Detroit/Acid/Industrial)": {
+        "bpm": (124, 140),
+        "bands_pct": {"low": (0.28, 0.55), "mid": (0.28, 0.55), "high": (0.12, 0.35)},
+        "hp_ratio": (0.85, 1.35),
+        "onset_strength": (0.45, 0.75),
+        "signatures": "estética clássica/analógica; pode ter TB-303 (acid), calor Detroit ou textura industrial",
     },
     "Peak Time Techno": {
-        "bpm": (128, 136),  # era até 132
+        "bpm": (128, 136),
         "bands_pct": {"low": (0.32, 0.56), "mid": (0.24, 0.42), "high": (0.18, 0.35)},
-        "hp_ratio": (0.85, 1.15),
+        "hp_ratio": (0.85, 1.20),
         "onset_strength": (0.55, 0.80),
         "signatures": "4x4 direto para ápice; leads discretos; energia constante (ref. Victor Ruiz – All Night Long)",
     },
     "Hard Techno": {
-        "bpm": (135, 165),  # era até 150
+        "bpm": (135, 165),
         "bands_pct": {"low": (0.35, 0.60), "mid": (0.22, 0.40), "high": (0.22, 0.42)},
-        "hp_ratio": (0.70, 1.30),  # era até 0.95
+        "hp_ratio": (0.70, 1.30),
         "onset_strength": (0.65, 0.90),
         "signatures": "agressivo e percussivo; kicks duros; pouca melodia",
     },
-    "Melodic Techno": {
-        "bpm": (122, 128),
-        "bands_pct": {"low": (0.22, 0.40), "mid": (0.38, 0.60), "high": (0.15, 0.32)},
-        "hp_ratio": (1.10, 1.80),
-        "onset_strength": (0.30, 0.60),
-        "signatures": "pads/leads emocionais e cinematográficos, progressão envolvente",
-    },
     "High-Tech Minimal": {
         "bpm": (124, 130),
-        "bands_pct": {"low": (0.30, 0.58), "mid": (0.22, 0.40), "high": (0.10, 0.25)},  # low mais amplo
-        "hp_ratio": (0.85, 1.60),  # era até 1.15
+        "bands_pct": {"low": (0.30, 0.58), "mid": (0.20, 0.40), "high": (0.10, 0.25)},
+        "hp_ratio": (0.85, 1.60),
         "onset_strength": (0.35, 0.60),
         "signatures": "minimalista, design sonoro detalhista; sub consistente, timbres enxutos",
     },
-    # ---------------- TRANCE ----------------
-    "Uplifting Trance": {
-        "bpm": (134, 140),
-        "bands_pct": {"low": (0.22, 0.40), "mid": (0.38, 0.58), "high": (0.22, 0.38)},  # high mínimo 0.22 (↑)
-        "hp_ratio": (1.30, 2.20),  # ligeiro ↑
-        "onset_strength": (0.60, 0.90),  # ↑ mais impacto
-        "signatures": "...",
+    "Melodic House & Techno": {
+        "bpm": (120, 128),
+        "bands_pct": {"low": (0.22, 0.42), "mid": (0.40, 0.65), "high": (0.15, 0.35)},
+        "hp_ratio": (1.20, 2.20),
+        "onset_strength": (0.30, 0.65),
+        "signatures": "pads/leads emotivos, progressão envolvente; abrange Artbat/Argy/Yubik e também vertentes house melódicas (Monolink/WhoMadeWho)",
     },
-    "Progressive Trance": {
-        "bpm": (132, 138),
-        "bands_pct": {"low": (0.22, 0.40), "mid": (0.40, 0.62), "high": (0.15, 0.26)},  # high máximo 0.26 (↓)
-        "hp_ratio": (1.10, 1.90),
-        "onset_strength": (0.25, 0.60),  # teto menor que Uplifting
-        "signatures": "...",
+
+    # ---------------- TRANCE ----------------
+    "Melodic & Progressive Trance": {
+        "bpm": (132, 140),
+        "bands_pct": {"low": (0.22, 0.42), "mid": (0.40, 0.62), "high": (0.18, 0.38)},
+        "hp_ratio": (1.20, 2.20),
+        "onset_strength": (0.35, 0.80),
+        "signatures": "trance melódico com builds (às vezes longos), foco em vocais/leads; menos agressivo",
     },
     "Psytrance": {
         "bpm": (138, 146),
@@ -235,6 +203,7 @@ SOFT_RULES: Dict[str, Dict] = {
         "onset_strength": (0.50, 0.75),
         "signatures": "mais escuro/denso; texturas e ruídos em destaque",
     },
+
     # ---------------- EDM (FESTIVAL) ----------------
     "Big Room": {
         "bpm": (126, 128),
@@ -243,13 +212,14 @@ SOFT_RULES: Dict[str, Dict] = {
         "onset_strength": (0.60, 0.85),
         "signatures": "drops marcados; dinâmica alta; hi-hats/brilho dando impacto",
     },
-    "Progressive EDM": {
-        "bpm": (126, 130),  # era 124–128
-        "bands_pct": {"low": (0.25, 0.45), "mid": (0.40, 0.60), "high": (0.25, 0.40)},  # high maior
-        "hp_ratio": (1.40, 2.20),  # mais melódico/brilhante
-        "onset_strength": (0.35, 0.60),
-        "signatures": "melódico de festival, polido, progressivo/pop-friendly",
+    "Progressive EDM & Future House": {
+        "bpm": (124, 130),
+        "bands_pct": {"low": (0.28, 0.55), "mid": (0.35, 0.55), "high": (0.25, 0.45)},
+        "hp_ratio": (1.20, 2.20),
+        "onset_strength": (0.40, 0.70),
+        "signatures": "melódico de festival / estética future; polido, brilhante, drops claros",
     },
+
     # ---------------- HARD DANCE ----------------
     "Hardstyle": {
         "bpm": (150, 160),
@@ -286,6 +256,14 @@ SOFT_RULES: Dict[str, Dict] = {
         "onset_strength": (0.55, 0.80),
         "signatures": "padrões rítmicos ‘saltados’, batidas quadradas",
     },
+    "Hard Dance/Groove": {
+        "bpm": (135, 150),
+        "bands_pct": {"low": (0.30, 0.55), "mid": (0.28, 0.48), "high": (0.22, 0.40)},
+        "hp_ratio": (0.90, 1.40),
+        "onset_strength": (0.60, 0.90),
+        "signatures": "hard techno mais dançante/pop; groove forte (refs: VTSS, Odymel, I Hate Models em certos casos)",
+    },
+
     # ---------------- BASS MUSIC ----------------
     "Dubstep": {
         "bpm": (136, 146),
@@ -319,8 +297,16 @@ SOFT_RULES: Dict[str, Dict] = {
 
 
 # =============================================================================
-# Carregamento multi-janela
+# Carregamento / duração / janelas
 # =============================================================================
+
+def get_duration_seconds(file_bytes: bytes) -> float | None:
+    try:
+        audio = AudioSegment.from_file(io.BytesIO(file_bytes))
+        return len(audio) / 1000.0
+    except Exception:
+        return None
+
 
 def _load_segment(file_bytes: bytes, offset_seconds: float, duration_seconds: float, sr: int = 22050) -> Tuple[np.ndarray, int]:
     """Carrega um segmento específico (offset/duration) com fallback pydub->wav."""
@@ -342,19 +328,14 @@ def _load_segment(file_bytes: bytes, offset_seconds: float, duration_seconds: fl
         return y, sr
 
 
-def load_audio_windows(file_bytes: bytes, sr: int = 22050) -> Dict[str, Tuple[np.ndarray, int]]:
+def load_audio_windows(file_bytes: bytes, sr: int = 22050) -> Tuple[Dict[str, Tuple[np.ndarray, int]], float | None]:
     """
-    Retorna 3 janelas:
-    - mid60:   60–120s (ou últimos 60s se a faixa < 120s)
+    Retorna (windows, duration_sec) com 3 janelas:
+    - mid60:    60–120s (ou últimos 60s se a faixa < 120s)
     - center30: 30s centrados na faixa
-    - last60:  últimos 60s (ou desde 0 se <60s)
+    - last60:   últimos 60s (ou desde 0 se <60s)
     """
-    try:
-        audio = AudioSegment.from_file(io.BytesIO(file_bytes))
-        duration_sec = len(audio) / 1000.0
-    except Exception:
-        audio = None
-        duration_sec = None
+    duration_sec = get_duration_seconds(file_bytes)
 
     windows: Dict[str, Tuple[np.ndarray, int]] = {}
 
@@ -385,7 +366,7 @@ def load_audio_windows(file_bytes: bytes, sr: int = 22050) -> Dict[str, Tuple[np
         off_last, dur_last = duration_sec - 60.0, 60.0
     windows["last60"] = _load_segment(file_bytes, off_last, dur_last, sr)
 
-    return windows
+    return windows, duration_sec
 
 
 # =============================================================================
@@ -401,7 +382,7 @@ def _bands_energy(y: np.ndarray, sr: int) -> Tuple[float, float, float, float]:
     low = float(yf[(xf >= 20) & (xf < 250)].sum())
     mid = float(yf[(xf >= 250) & (xf < 4000)].sum())
     high = float(yf[(xf >= 4000) & (xf <= 20000)].sum())
-    kick = float(yf[(xf >= 40) & (xf < 100)].sum())  # ajuda Tech House/PeakTime/Minimal Bass
+    kick = float(yf[(xf >= 40) & (xf < 100)].sum())  # ajuda Tech House/PeakTime/Hard
 
     return low, mid, high, kick
 
@@ -508,7 +489,7 @@ def extract_features(y: np.ndarray, sr: int) -> Dict[str, float | int | None]:
 def extract_features_multi(windows: Dict[str, Tuple[np.ndarray, int]]) -> Dict[str, float | int | None]:
     """
     Combina 3 janelas com PESOS:
-    mid60=0.2, center30=0.3, last60=0.5 (mais peso ao final).
+    mid60=0.15, center30=0.25, last60=0.60 (mais peso ao final).
     BPM = mediana ponderada aproximada (via repetição por peso).
     Demais = média ponderada.
     """
@@ -559,10 +540,11 @@ def build_tech_line(
     cands: List[str],
     chosen: str,
     decision_source: str,
+    duration_sec: float | None = None,
 ) -> str:
     """
     Retorna UMA linha com os principais dados extraídos e contexto da decisão.
-    Ex.: BPM=128; low%=35.2%; mid%=44.1%; high%=20.7%; hp=1.12; onset=0.53; kick=1234567; cands=[Tech House,...]; chosen=Tech House; source=llm
+    Ex.: BPM=128; low%=35.2%; mid%=44.1%; high%=20.7%; hp=1.12; onset=0.53; kick=1234567; dur=366s; cands=[...]; chosen=X; source=llm
     """
     bpm = feats.get("bpm")
     low_pct = feats.get("low_pct")
@@ -580,6 +562,7 @@ def build_tech_line(
         f"hp={_fmt_float(hp,2)}",
         f"onset={_fmt_float(onset,2)}",
         f"kick={int(kick) if kick is not None else 'n/a'}",
+        f"dur={int(duration_sec) if duration_sec is not None else 'n/a'}s",
         f"cands=[{', '.join(cands)}]",
         f"chosen={chosen}",
         f"source={decision_source}",
@@ -607,7 +590,11 @@ def candidates_by_bpm(bpm: float | None) -> List[str]:
     return list(SOFT_RULES.keys())
 
 
-def backend_fallback_best_candidate(features: Dict[str, float | int | None], candidates: List[str]) -> str:
+def backend_fallback_best_candidate(
+    features: Dict[str, float | int | None],
+    candidates: List[str],
+    duration_sec: float | None = None,
+) -> str:
     """Se o LLM falhar, escolhe o melhor candidato (sem confidence)."""
     bpm = features.get("bpm")
     lp = features.get("low_pct", 0.0) or 0.0
@@ -642,13 +629,18 @@ def backend_fallback_best_candidate(features: Dict[str, float | int | None], can
         score = 0.45 * s_bpm + 0.40 * bands_avg + 0.15 * s_hp
 
         # bônus suave se o kick está forte (gêneros 4x4 voltados à pista)
-        if name in ("Tech House", "Peak Time Techno", "Minimal Bass (Tech House)", "Hard Techno", "High-Tech Minimal") and kick > 0:
+        if name in ("Tech House", "Peak Time Techno", "Hard Techno", "High-Tech Minimal", "Hard Dance/Groove") and kick > 0:
             score *= 1.03  # leve viés pró pista
-      
-      # desempate pró Melodic Techno quando bem melódica
-        if name == "Melodic Techno":
+
+        # desempate pró Melodic House & Techno quando bem melódica (mid alto + hp_ratio alto, bpm 120–128)
+        if name == "Melodic House & Techno":
             if (hpr >= 1.60) and (mp >= 0.45) and (120 <= (bpm or 0) <= 128):
-                score *= 1.04  # viés leve pró MT em casos "claros"
+                score *= 1.04
+
+        # Progressive House: bônus se a faixa for longa (>= 300s)
+        if name == "Progressive House" and duration_sec is not None and duration_sec >= 300.0:
+            score *= 1.04
+
         if score > best_score:
             best_score = score
             best_name = name
@@ -701,7 +693,7 @@ Você é um especialista em música eletrônica. Classifique a faixa com base na
 As features vêm de três janelas (mid60, center30, last60) agregadas por mediana/média ponderada (mais peso no final).
 
 REGRAS:
-- Use APENAS um subgênero dentre CANDIDATES.
+- Use APENAS um subgênero dentre CANDIDATES (nova taxonomia).
 - Compare FEATURES com CANDIDATE_RULES (BPM, Bandas%, HP Ratio).
 - Calcule internamente uma similaridade ponderada:
   - BPM (peso 0.45): maior se o BPM cair dentro da faixa do candidato (ou perto do centro).
@@ -714,7 +706,7 @@ RESPOSTA: exatamente UMA linha, no formato:
 Subgênero: <um dos CANDIDATES ou 'Subgênero Não Identificado'>
 
 Observações internas (não exponha):
-- Absorções: Bass House ← Electro House; Uplifting/Progressive Trance ← Vocal Trance; Psytrance ← Goa; Dubstep ← Riddim.
+- Absorções: Dubstep ← Riddim; Psytrance ← Goa; Progressive EDM & Future House absorve Future House; Old School Techno engloba Detroit/Acid/Industrial.
 - Priorize o candidato com melhor aderência NUMÉRICA às faixas (BPM/bandas/hp_ratio).
 """
 
@@ -753,7 +745,7 @@ def call_gpt(features: Dict[str, float | int | None], candidates: List[str]) -> 
 # FastAPI
 # =============================================================================
 
-app = FastAPI(title="saasdj-backend (organizado v3)")
+app = FastAPI(title="saasdj-backend (organizado v4)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -765,7 +757,7 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "saasdj-backend", "version": "v3"}
+    return {"ok": True, "service": "saasdj-backend", "version": "v4"}
 
 
 @app.post("/classify")
@@ -776,7 +768,7 @@ async def classify(file: UploadFile = File(...)):
     {
       "bpm": <int|None>,
       "subgenero": <str>,
-      "analise": "BPM=...; low%=...; mid%=...; high%=...; hp=...; onset=...; kick=...; cands=[...]; chosen=...; source=llm|fallback"
+      "analise": "BPM=...; low%=...; mid%=...; high%=...; hp=...; onset=...; kick=...; dur=...s; cands=[...]; chosen=...; source=llm|fallback"
     }
     """
     try:
@@ -788,8 +780,11 @@ async def classify(file: UploadFile = File(...)):
         if not data:
             raise HTTPException(400, "Arquivo vazio")
 
+        # 0) Duração total da faixa
+        duration_sec = get_duration_seconds(data)
+
         # 1) Carregar 3 janelas e extrair features agregadas
-        windows = load_audio_windows(data)
+        windows, _dur = load_audio_windows(data)
         feats = extract_features_multi(windows)
 
         # 2) Selecionar candidatos por BPM
@@ -801,7 +796,7 @@ async def classify(file: UploadFile = File(...)):
             content = call_gpt(feats, cands)
         except Exception as e:
             # Falha na OpenAI — Fallback heurístico
-            fb_sub = backend_fallback_best_candidate(feats, cands)
+            fb_sub = backend_fallback_best_candidate(feats, cands, duration_sec=duration_sec)
             bpm_int = int(round(bpm_val)) if bpm_val is not None else None
 
             decision_source = "fallback"
@@ -810,6 +805,7 @@ async def classify(file: UploadFile = File(...)):
                 cands=cands,
                 chosen=fb_sub if fb_sub in SUBGENRES else "Subgênero Não Identificado",
                 decision_source=decision_source,
+                duration_sec=duration_sec,
             )
 
             return JSONResponse(
@@ -836,7 +832,7 @@ async def classify(file: UploadFile = File(...)):
         # 6) Fallback heurístico se o LLM não identificar
         decision_source = "llm"
         if sub == "Subgênero Não Identificado":
-            fb_sub = backend_fallback_best_candidate(feats, cands)
+            fb_sub = backend_fallback_best_candidate(feats, cands, duration_sec=duration_sec)
             if fb_sub != "Subgênero Não Identificado":
                 sub = fb_sub
                 decision_source = "fallback"
@@ -850,6 +846,7 @@ async def classify(file: UploadFile = File(...)):
             cands=cands,
             chosen=sub,
             decision_source=decision_source,
+            duration_sec=duration_sec,
         )
 
         return {
@@ -871,6 +868,7 @@ async def classify(file: UploadFile = File(...)):
             bpm_val = locals().get("bpm_val", None)
             feats = locals().get("feats", None)
             cands = locals().get("cands", [])
+            duration_sec = locals().get("duration_sec", None)
             if feats:
                 bpm_out = int(round(bpm_val)) if bpm_val is not None else None
                 tech_line = build_tech_line(
@@ -878,6 +876,7 @@ async def classify(file: UploadFile = File(...)):
                     cands=cands if cands else list(SOFT_RULES.keys()),
                     chosen="Subgênero Não Identificado",
                     decision_source="fallback-error",
+                    duration_sec=duration_sec,
                 )
                 payload.update({"bpm": bpm_out, "analise": tech_line})
         except Exception:
