@@ -846,51 +846,28 @@ async def classify(file: UploadFile = File(...)):
         if not data:
             raise HTTPException(400, "Arquivo vazio")
 
-        # 0) Duração total
-        duration_sec = _measure_duration_sec(data)
-
-        # 1) Carregar janela única (mid90) e extrair features
+        # 1) Carregar janela única (mid90) e extrair features (com duração)
         windows, duration_sec = load_audio_windows(data)
         feats = extract_features_multi(windows, duration_sec)
 
-        # 1.1) Reforço anti-dobro (consenso já considerado; aqui uma última checagem)
-        bpm_val = feats_agg.get("bpm")
-        if bpm_val is not None and bpm_val > 150:
-            half = bpm_val / 2.0
-            # heurística: se half cai bem nas faixas de House/Techno/Trance e bandas não parecem Hard,
-            # usar half como BPM final
-            friendly = ("Tech House", "Progressive House", "Melodic House & Techno", "Peak Time Techno", "Afro House", "Indie Dance",
-                        "Old School Techno (Detroit/Acid/Industrial)", "Big Room", "Progressive EDM & Future House")
-            ok_half = False
-            for name in friendly:
-                lo, hi = SOFT_RULES[name]["bpm"]
-                if (half >= lo - 2) and (half <= hi + 2):
-                    ok_half = True
-                    break
-            # se high% e onset não são de Hard Dance, preferir half
-            if ok_half:
-                if (feats_agg.get("high_pct", 0) <= 0.35) and (feats_agg.get("onset_strength", 0) <= 0.85):
-                    feats_agg["bpm"] = round(half, 3)
-
         # 2) Selecionar candidatos por BPM
-        bpm_val = feats_agg.get("bpm")
+        bpm_val = feats.get("bpm")
         cands = candidates_by_bpm(bpm_val)
 
         # 3) Chamar GPT com candidatos e regras
         try:
-            content = call_gpt(feats_agg, feats_windows, cands, duration_sec)
+            content = call_gpt(feats, cands)
         except Exception as e:
             # Falha na OpenAI — Fallback heurístico
-            fb_sub = backend_fallback_best_candidate(feats_agg, cands, duration_sec)
+            fb_sub = backend_fallback_best_candidate(feats, cands)
             bpm_int = int(round(bpm_val)) if bpm_val is not None else None
 
             decision_source = "fallback"
             tech_line = build_tech_line(
-                feats=feats_agg,
+                feats=feats,
                 cands=cands,
                 chosen=fb_sub if fb_sub in SUBGENRES else "Subgênero Não Identificado",
                 decision_source=decision_source,
-                duration_sec=duration_sec,
             )
 
             return JSONResponse(
@@ -917,7 +894,7 @@ async def classify(file: UploadFile = File(...)):
         # 6) Fallback heurístico se o LLM não identificar
         decision_source = "llm"
         if sub == "Subgênero Não Identificado":
-            fb_sub = backend_fallback_best_candidate(feats_agg, cands, duration_sec)
+            fb_sub = backend_fallback_best_candidate(feats, cands)
             if fb_sub != "Subgênero Não Identificado":
                 sub = fb_sub
                 decision_source = "fallback"
@@ -927,11 +904,10 @@ async def classify(file: UploadFile = File(...)):
 
         # 8) SEMPRE incluir a linha técnica "analise"
         tech_line = build_tech_line(
-            feats=feats_agg,
+            feats=feats,
             cands=cands,
             chosen=sub,
             decision_source=decision_source,
-            duration_sec=duration_sec,
         )
 
         return {
@@ -950,21 +926,21 @@ async def classify(file: UploadFile = File(...)):
             "error": f"processing failed: {e.__class__.__name__}: {e}",
         }
         try:
-            duration_sec = locals().get("duration_sec", None)
-            feats = locals().get("feats_agg", None)
+            # tenta aproveitar variáveis locais se existirem
+            bpm_val = locals().get("bpm_val", None)
+            feats = locals().get("feats", None)
             cands = locals().get("cands", [])
             if feats:
-                bpm_val = feats.get("bpm")
                 bpm_out = int(round(bpm_val)) if bpm_val is not None else None
                 tech_line = build_tech_line(
                     feats=feats,
                     cands=cands if cands else list(SOFT_RULES.keys()),
                     chosen="Subgênero Não Identificado",
                     decision_source="fallback-error",
-                    duration_sec=duration_sec,
                 )
                 payload.update({"bpm": bpm_out, "analise": tech_line})
         except Exception:
             pass
 
         return JSONResponse(status_code=500, content=payload)
+
