@@ -348,46 +348,39 @@ def _measure_duration_sec(file_bytes: bytes) -> float | None:
         return None
 
 
-def load_audio_windows(file_bytes: bytes, sr: int = 22050) -> Tuple[Dict[str, Tuple[np.ndarray, int]], float | None]:
+def load_audio_windows(file_bytes: bytes, sr: int = 22050) -> Tuple[Dict[str, Tuple[np.ndarray, int]], float]:
     """
-    Retorna 3 janelas:
-    - mid60:   60–120s (ou últimos 60s se a faixa < 120s)
-    - center30: 30s centrados na faixa
-    - last60:  últimos 60s (ou desde 0 se <60s)
-    e a duração total em segundos (dur).
+    Janela única 'mid90': 90s a partir de 60s (1:00 -> 2:30).
+    Fallbacks:
+      - se a faixa < 150s: usa 90s centrados (ou o máximo possível).
+    Retorna (windows, duration_sec).
     """
-    duration_sec = _measure_duration_sec(file_bytes)
+    try:
+        audio = AudioSegment.from_file(io.BytesIO(file_bytes))
+        duration_sec = len(audio) / 1000.0
+    except Exception:
+        audio = None
+        duration_sec = None
 
-    windows: Dict[str, Tuple[np.ndarray, int]] = {}
+    # alvo: offset=60.0, dur=90.0
+    target_off, target_dur = 60.0, 90.0
 
-    # mid60
-    if duration_sec is None or duration_sec >= 120.0:
-        off_mid60, dur_mid60 = 60.0, 60.0
-    else:
-        off_mid60 = max(0.0, duration_sec - 60.0)
-        dur_mid60 = min(60.0, duration_sec - off_mid60)
-    windows["mid60"] = _load_segment(file_bytes, off_mid60, dur_mid60, sr)
-
-    # center30
     if duration_sec is None:
-        # fallback: recorta do mid60
-        y_mid, sr_mid = windows["mid60"]
-        n = len(y_mid)
-        start = max(0, n // 2 - int(15 * sr_mid))
-        end = min(n, start + int(30 * sr_mid))
-        windows["center30"] = (y_mid[start:end], sr_mid)
-    else:
-        start_center = max(0.0, (duration_sec / 2.0) - 15.0)
-        windows["center30"] = _load_segment(file_bytes, start_center, min(30.0, duration_sec), sr)
+        # sem metadados de duração — tenta carregar a partir de 60s por 90s
+        y, sr = _load_segment(file_bytes, target_off, target_dur, sr)
+        return {"mid90": (y, sr)}, float(len(y) / sr)
 
-    # last60
-    if duration_sec is None or duration_sec <= 60.0:
-        off_last, dur_last = 0.0, min(60.0, duration_sec or 60.0)
+    if duration_sec >= 150.0:
+        off = target_off
+        dur = min(target_dur, duration_sec - off)
     else:
-        off_last, dur_last = duration_sec - 60.0, 60.0
-    windows["last60"] = _load_segment(file_bytes, off_last, dur_last, sr)
+        # se não tem 150s, pega 90s centrados, ou o que couber
+        center = max(0.0, duration_sec / 2.0 - 45.0)
+        off = max(0.0, min(center, max(0.0, duration_sec - 90.0)))
+        dur = min(90.0, duration_sec - off)
 
-    return windows, duration_sec
+    y, sr = _load_segment(file_bytes, off, dur, sr)
+    return {"mid90": (y, sr)}, float(duration_sec)
 
 
 # =============================================================================
@@ -542,58 +535,15 @@ def extract_features(y: np.ndarray, sr: int) -> Dict[str, float | int | None]:
     }
 
 
-def extract_features_multi(windows: Dict[str, Tuple[np.ndarray, int]]) -> Tuple[Dict[str, float | int | None], Dict[str, Dict[str, float | int | None]]]:
+def extract_features_multi(windows: Dict[str, Tuple[np.ndarray, int]], duration_sec: float) -> Dict[str, float | int | None]:
     """
-    Combina 3 janelas com PESOS:
-    mid60=0.15, center30=0.25, last60=0.60 (mais peso ao final).
-    BPM = consenso entre as BPMS por janela; se falhar, mediana ponderada.
-    Demais = média ponderada.
-    Também retorna as features por janela (para análise do LLM/heurísticas).
+    Extrai features apenas da janela 'mid90'.
+    Inclui 'duration_sec' nas features para regras baseadas em duração.
     """
-    order = [("mid60", 0.15), ("center30", 0.25), ("last60", 0.60)]
-    feats_per_window: Dict[str, Dict[str, float | int | None]] = {}
-
-    bpm_list = []
-    for key, _w in order:
-        y, sr = windows[key]
-        f = extract_features(y, sr)
-        feats_per_window[key] = f
-        if f.get("bpm") is not None:
-            bpm_list.append(float(f["bpm"]))
-
-    # 1) BPM por consenso
-    bpm_consensus = _choose_bpm_consensus(bpm_list)
-    # 2) fallback mediana ponderada
-    if bpm_consensus is None and bpm_list:
-        weighted = []
-        for (key, w) in order:
-            b = feats_per_window[key].get("bpm")
-            if b is not None:
-                weighted += [b] * max(1, int(round(w * 10)))
-        if weighted:
-            bpm_consensus = float(np.median(weighted))
-
-    def wavg(k):
-        vals, ws = [], []
-        for (key, w) in order:
-            v = feats_per_window[key].get(k)
-            if v is not None:
-                vals.append(v); ws.append(w)
-        return float(np.average(vals, weights=ws)) if vals else None
-
-    feats_agg = {
-        "bpm": round(bpm_consensus, 3) if bpm_consensus else None,
-        "energy_low": wavg("energy_low"),
-        "energy_mid": wavg("energy_mid"),
-        "energy_high": wavg("energy_high"),
-        "kick_40_100": wavg("kick_40_100"),
-        "low_pct": wavg("low_pct"),
-        "mid_pct": wavg("mid_pct"),
-        "high_pct": wavg("high_pct"),
-        "hp_ratio": wavg("hp_ratio"),
-        "onset_strength": wavg("onset_strength"),
-    }
-    return feats_agg, feats_per_window
+    y, sr = windows["mid90"]
+    f = extract_features(y, sr)
+    f["duration_sec"] = float(duration_sec)
+    return f
 
 
 # === Helper: linha técnica na resposta ===
@@ -609,12 +559,7 @@ def build_tech_line(
     cands: List[str],
     chosen: str,
     decision_source: str,
-    duration_sec: float | None,
 ) -> str:
-    """
-    Retorna UMA linha com os principais dados extraídos e contexto da decisão.
-    Ex.: BPM=128; low%=35.2%; mid%=44.1%; high%=20.7%; hp=1.12; onset=0.53; kick=1234567; dur=345s; cands=[Tech House,...]; chosen=Tech House; source=llm
-    """
     bpm = feats.get("bpm")
     low_pct = feats.get("low_pct")
     mid_pct = feats.get("mid_pct")
@@ -622,6 +567,7 @@ def build_tech_line(
     hp = feats.get("hp_ratio")
     onset = feats.get("onset_strength")
     kick = feats.get("kick_40_100")
+    dur = feats.get("duration_sec")
 
     parts = [
         f"BPM={int(round(bpm)) if bpm is not None else 'n/a'}",
@@ -631,12 +577,13 @@ def build_tech_line(
         f"hp={_fmt_float(hp,2)}",
         f"onset={_fmt_float(onset,2)}",
         f"kick={int(kick) if kick is not None else 'n/a'}",
-        f"dur={int(duration_sec) if duration_sec is not None else 'n/a'}s",
+        f"dur={int(dur) if dur is not None else 'n/a'}s",
         f"cands=[{', '.join(cands)}]",
         f"chosen={chosen}",
         f"source={decision_source}",
     ]
     return "; ".join(parts)
+
 
 
 # =============================================================================
@@ -703,93 +650,51 @@ def _indie_dance_bonus(lp, mp, hpv, hpr, onset, bpm, kick, duration_sec) -> floa
     return score
 
 
-def backend_fallback_best_candidate(
-    features: Dict[str, float | int | None],
-    candidates: List[str],
-    duration_sec: float | None,
-) -> str:
-    """
-    Se o LLM falhar, escolhe o melhor candidato (sem confidence) com heurísticas:
-    - Gate de duração para Progressive House (>=300s favorece PH; <300s penaliza PH vs Melodic H&T)
-    - Anti-"PH engolir": high% <= 0.28, mid alto consistente
-    - Kick bias para 4x4 pista (Tech House / PTT / Hard Techno / High-Tech Minimal / Hard Dance/Groove)
-    - Priorização Indie Dance quando assinatura bate
-    - Anti-dobro para BPM >150 quando bandas não casam com Hard Dance
-    """
+def backend_fallback_best_candidate(features: Dict[str, float | int | None], candidates: List[str]) -> str:
+    """Se o LLM falhar, escolhe o melhor candidato (sem confidence). Aplica viés por duração p/ Progressive House."""
     bpm = features.get("bpm")
     lp = features.get("low_pct", 0.0) or 0.0
     mp = features.get("mid_pct", 0.0) or 0.0
     hpv = features.get("high_pct", 0.0) or 0.0
     hpr = features.get("hp_ratio", 0.0) or 0.0
-    onset = features.get("onset_strength", 0.0) or 0.0
     kick = features.get("kick_40_100", 0.0) or 0.0
+    dur = float(features.get("duration_sec", 0.0) or 0.0)
+
+    def _score_in_range(val: float | None, rng: Tuple[float, float]) -> float:
+        lo, hi = rng
+        if val is None:
+            return 0.0
+        if val < lo:
+            return max(0.0, 1.0 - (lo - val) / (hi - lo + 1e-6))
+        if val > hi:
+            return max(0.0, 1.0 - (val - hi) / (hi - lo + 1e-6))
+        mid = (lo + hi) / 2.0
+        half = (hi - lo) / 2.0 + 1e-6
+        return 1.0 + max(0.0, 0.2 * (1.0 - abs(val - mid) / half))
 
     best_name = "Subgênero Não Identificado"
     best_score = 0.0
-
     for name in candidates:
         rule = SOFT_RULES[name]
-        s_bpm = _score_in_range(bpm, rule["bpm"])
-        s_low = _score_in_range(lp, rule["bands_pct"]["low"])
-        s_mid = _score_in_range(mp, rule["bands_pct"]["mid"])
+        s_bpm  = _score_in_range(bpm, rule["bpm"])
+        s_low  = _score_in_range(lp,  rule["bands_pct"]["low"])
+        s_mid  = _score_in_range(mp,  rule["bands_pct"]["mid"])
         s_high = _score_in_range(hpv, rule["bands_pct"]["high"])
-        s_hp = _score_in_range(hpr, rule["hp_ratio"])
+        s_hp   = _score_in_range(hpr, rule["hp_ratio"])
 
         bands_avg = (s_low + s_mid + s_high) / 3.0
         score = 0.45 * s_bpm + 0.40 * bands_avg + 0.15 * s_hp
 
-        # ---- BÔNUS/penalidades por estilo ----
+        # bônus suave para pista 4x4 com kick forte
+        if name in ("Tech House", "Peak Time Techno", "Hard Techno", "High-Tech Minimal") and kick > 0:
+            score *= 1.03
 
-        # Progressive House gate por duração
+        # viés forte por duração para Progressive House
         if name == "Progressive House":
-            if duration_sec is not None and duration_sec >= 300:
-                score *= 1.05  # favorece quando longo
+            if dur >= 300.0:   # 5 minutos
+                score *= 1.20   # bônus forte
             else:
-                score *= 0.93  # penaliza quando curto
-            # PH não deve brilhar demais
-            if hpv > 0.28:
-                score *= 0.92
-
-        # Melodic House & Techno ganha quando melódico e não muito curto
-        if name == "Melodic House & Techno":
-            if hpr >= 1.40 and mp >= 0.45:
-                score *= 1.04
-            if duration_sec is not None and duration_sec < 300:
-                score *= 1.02  # leve viés pró MH&T em faixas mais curtas, evitando PH
-
-        # Peak Time Techno: pista + 4x4
-        if name == "Peak Time Techno":
-            if kick > 0:
-                score *= 1.03
-            if (mp <= 0.50) and (hpv <= 0.35) and (0.85 <= hpr <= 1.30):
-                score *= 1.02
-
-        # Old School Techno
-        if name == "Old School Techno (Detroit/Acid/Industrial)":
-            if (0.45 <= onset <= 0.80) and (0.85 <= hpr <= 1.35) and (hpv <= 0.32):
-                score *= 1.02
-
-        # Hard Techno vs Hardstyle/Rawstyle
-        if bpm is not None and 150 <= bpm <= 165:
-            if name in ("Hardstyle", "Rawstyle"):
-                if hpv >= 0.25 and onset >= 0.80:
-                    score *= 1.03  # brilho mais alto e onsets fortes → favorece HS/Raw
-            if name == "Hard Techno":
-                if hpv < 0.25 and kick > 0:
-                    score *= 1.02  # hard techno mais seco
-
-        # Hard Dance/Groove: 4x4 dançante, não tão serrado
-        if name == "Hard Dance/Groove":
-            if 135 <= (bpm or 0) <= 150 and (onset >= 0.60) and (hpv <= 0.35):
-                score *= 1.03
-
-        # Indie Dance reforço
-        if name == "Indie Dance":
-            score *= _indie_dance_bonus(lp, mp, hpv, hpr, onset, bpm, kick, duration_sec)
-
-        # Anti-dobro: se BPM >150 e bandas não casam com Hard Dance, desincentivar não-hard
-        if (bpm or 0) > 150 and name not in ("Hard Techno", "Hardstyle", "Rawstyle", "Gabber Hardcore", "UK/Happy Hardcore", "Jumpstyle", "Hard Dance/Groove", "Drum & Bass", "Liquid DnB", "Neurofunk"):
-            score *= 0.97
+                score *= 0.80   # penalidade forte
 
         if score > best_score:
             best_score = score
@@ -840,31 +745,29 @@ def format_rules_for_candidates(cands: List[str]) -> str:
 
 PROMPT = """
 Você é um especialista em música eletrônica. Classifique a faixa com base nas FEATURES abaixo.
-As features vêm de três janelas (mid60, center30, last60) agregadas por consenso/média ponderada (mais peso no final).
-A lista CANDIDATES já está filtrada por BPM, e CANDIDATE_RULES traz faixas numéricas.
+As features vêm de uma janela única de 90s entre 60s e 150s (1:00 → 2:30), pensada para capturar o trecho mais representativo.
 
 REGRAS:
 - Use APENAS um subgênero dentre CANDIDATES.
 - Compare FEATURES com CANDIDATE_RULES (BPM, Bandas%, HP Ratio).
 - Calcule internamente uma similaridade ponderada:
-  - BPM (peso 0.45): maior se o BPM cair dentro da faixa do candidato (ou perto do centro).
-  - Bandas% (peso 0.40): maior quanto mais low/mid/high_pct caírem nas faixas do candidato.
-  - HP Ratio (peso 0.15): maior se dentro da faixa.
-- Aplique os seguintes desempates semânticos quando números empatarem:
-  - Progressive House favorece faixas LONGAS (>= 300s) e brilho mais contido (high% <= 0.28); se < 300s e a faixa for bem melódica, prefira Melodic House & Techno.
-  - Indie Dance: BPM <= 123 (preferencial <=122), mid% alto, high% contido, kick discreto e onset contido — favoreça Indie Dance sobre Progressive House.
-  - Peak Time Techno: 4x4 de pista (kick forte), mid moderado, hpr ~1.0; se muito melódico (hp_ratio alto + high% mais alto), pode tender a “Melodic & Progressive Trance”.
-  - Old School Techno: estética clássica (Detroit/Acid/Industrial), hpr moderado, high% contido.
-  - Se BPM > 150 e bandas não casam com Hard Dance, reavalie candidatos equivalentes em BPM/2.
+  - BPM (peso 0.45)
+  - Bandas% (peso 0.40)
+  - HP Ratio (peso 0.15)
+- Duração como heurística adicional:
+  - Se DURATION_SEC ≥ 300s (≥ 5 min), aplique forte viés pró "Progressive House" quando BPM e Bandas% forem compatíveis.
+  - Se DURATION_SEC < 300s, penalize "Progressive House".
+- Escolha o candidato de MAIOR similaridade.
 - Só use 'Subgênero Não Identificado' se a similaridade final for muito baixa (ex.: < 0.40).
 
 RESPOSTA: exatamente UMA linha, no formato:
 Subgênero: <um dos CANDIDATES ou 'Subgênero Não Identificado'>
 
 Observações internas (não exponha):
-- Absorções: Dubstep ← Riddim.
-- Priorize o candidato com melhor aderência NUMÉRICA às faixas (BPM/bandas/hp_ratio) + desempates acima.
+- Absorções (se aplicável): Bass House ← Electro House; Psytrance ← Goa; Dubstep ← Riddim.
+- Priorize a aderência NUMÉRICA às faixas (BPM/bandas/hp_ratio) + heurística de duração descrita acima.
 """
+
 
 
 def call_gpt(
@@ -946,9 +849,9 @@ async def classify(file: UploadFile = File(...)):
         # 0) Duração total
         duration_sec = _measure_duration_sec(data)
 
-        # 1) Carregar 3 janelas e extrair features agregadas + por janela
-        windows, _ = load_audio_windows(data)
-        feats_agg, feats_windows = extract_features_multi(windows)
+        # 1) Carregar janela única (mid90) e extrair features
+        windows, duration_sec = load_audio_windows(data)
+        feats = extract_features_multi(windows, duration_sec)
 
         # 1.1) Reforço anti-dobro (consenso já considerado; aqui uma última checagem)
         bpm_val = feats_agg.get("bpm")
